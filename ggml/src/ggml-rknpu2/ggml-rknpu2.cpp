@@ -461,8 +461,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
+        const auto* op_support = config.find_op_support(w_type);
         if (node->op == GGML_OP_MUL_MAT) {
-            const auto* op_support = config.find_op_support(w_type);
             bool supported_by_npu = (op_support != nullptr);
 
             // Check if src0 is packed. If it's in a view, we check the base tensor.
@@ -688,7 +688,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             // Multiply by random sign vector
                             for (int k = 0; k < padded_K; ++k) tmp_row[k] *= s_vec[k];
                             // Fast Walsh-Hadamard Transform
-                            rknpu2_calibration::fwht(tmp_row.data(), padded_K);
+                            rknpu2_calibration::hadamard_transform(tmp_row.data(), tmp_row.data(), K, padded_K);
 
                             float amax_m = 0.0f;
                             for (int k = 0; k < padded_K; ++k) amax_m = std::max(amax_m, std::abs(tmp_row[k]));
@@ -1037,7 +1037,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                     // Multiply by random sign vector
                     for (int k = 0; k < padded_K; ++k) tmp_row[k] *= s_vec[k];
                     // Fast Walsh-Hadamard Transform
-                    rknpu2_calibration::fwht(tmp_row.data(), padded_K);
+                    rknpu2_calibration::hadamard_transform(tmp_row.data(), tmp_row.data(), K, padded_K);
                     memcpy(hadamard_data.data() + (size_t)n * padded_K, tmp_row.data(), padded_K * sizeof(float));
                     for (int k = 0; k < padded_K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
                 }
@@ -1055,7 +1055,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             std::vector<int8_t> quantized_data((size_t)padded_K * N);
             #pragma omp parallel for
             for (int n = 0; n < N; ++n) {
-                rknpu2_quantization::quantize_fp32_to_int4(hadamard_data.data() + (size_t)n * padded_K, quantized_data.data() + (size_t)n * padded_K, padded_K, global_scale_b);
+                rknpu2_quantization::quantize_fp32_to_int8(hadamard_data.data() + (size_t)n * padded_K, quantized_data.data() + (size_t)n * padded_K, padded_K, global_scale_b);
             }
 
             // Packing into native format
