@@ -164,17 +164,80 @@ struct rknpu_matmul_context {
 };
 
 
-// Backend main context
-struct ggml_backend_rknpu_context {
-    std::string name;
+struct rknpu_memory_context {
+    rknn_matmul_ctx mem_ctx = 0;
     std::mutex mutex;
 
     // RKNN matmul contexts cache
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
 
     // B-matrices handle cache (from fd)
-    // Key: <buffer_ptr, offset>
-    std::unordered_map<std::tuple<ggml_backend_buffer_t, size_t>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> b_mem_handle_cache;
+    // Key: <fd, offset, size>
+    std::unordered_map<std::tuple<int, size_t, size_t>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> b_mem_handle_cache;
+
+    rknpu_memory_context() {
+        rknn_matmul_info dummy_info;
+        memset(&dummy_info, 0, sizeof(dummy_info));
+        dummy_info.M = 32;
+        dummy_info.K = 32;
+        dummy_info.N = 32;
+        dummy_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
+
+        rknn_matmul_io_attr dummy_io_attr;
+        int ret = rknn_matmul_create(&mem_ctx, &dummy_info, &dummy_io_attr);
+        if (ret < 0) mem_ctx = 0;
+    }
+
+    ~rknpu_memory_context() {
+        if (mem_ctx != 0) {
+            rknn_matmul_destroy(mem_ctx);
+        }
+    }
+
+    rknn_matmul_ctx get_ctx() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return mem_ctx;
+    }
+
+    std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto key = std::make_tuple(M, K, N, core_id, (int)type);
+        auto it = matmul_ctx_cache.find(key);
+        if (it != matmul_ctx_cache.end()) {
+            return it->second;
+        }
+        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type);
+        if (!ctx || ctx->ctx == 0) {
+            return nullptr;
+        }
+
+        rknn_core_mask core_mask;
+        switch(core_id) {
+            case 0: core_mask = RKNN_NPU_CORE_0; break;
+            case 1: core_mask = RKNN_NPU_CORE_1; break;
+            case 2: core_mask = RKNN_NPU_CORE_2; break;
+            default: core_mask = RKNN_NPU_CORE_AUTO; break;
+        }
+
+        int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
+        if (ret != RKNN_SUCC) {
+            // Handle error
+        }
+
+        matmul_ctx_cache[key] = ctx;
+        return ctx;
+    }
+};
+
+static rknpu_memory_context & get_rknpu_memory_context() {
+    static rknpu_memory_context g_mem_ctx;
+    return g_mem_ctx;
+}
+
+// Backend main context
+struct ggml_backend_rknpu_context {
+    std::string name;
+    std::mutex mutex;
 
     // A- and C-matrices cache (from create_mem)
     // Key: <M, N or K, type>
@@ -203,69 +266,9 @@ struct ggml_backend_rknpu_context {
     }
 
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type) {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto key = std::make_tuple(M, K, N, core_id, (int)type);
-        auto it = matmul_ctx_cache.find(key);
-        if (it != matmul_ctx_cache.end()) {
-            return it->second;
-        }
-        auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type);
-        if (ctx->ctx == 0) {
-            return nullptr;
-        }
-
-        rknn_core_mask core_mask;
-        switch(core_id) {
-            case 0: core_mask = RKNN_NPU_CORE_0; break;
-            case 1: core_mask = RKNN_NPU_CORE_1; break;
-            case 2: core_mask = RKNN_NPU_CORE_2; break;
-            default: core_mask = RKNN_NPU_CORE_AUTO; break;
-        }
-
-        int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
-        if (ret != RKNN_SUCC) {
-            // Handle error
-        }
-
-        matmul_ctx_cache[key] = ctx;
-        return ctx;
+        return get_rknpu_memory_context().get_matmul_ctx(M, K, N, core_id, type);
     }
 };
-
-// RKNN memory global context
-struct rknpu_memory_context {
-    rknn_matmul_ctx mem_ctx = 0;
-    std::mutex mutex;
-
-    rknpu_memory_context() {
-        rknn_matmul_info dummy_info;
-        memset(&dummy_info, 0, sizeof(dummy_info));
-        dummy_info.M = 32;
-        dummy_info.K = 32;
-        dummy_info.N = 32;
-        dummy_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
-
-        rknn_matmul_io_attr dummy_io_attr;
-        int ret = rknn_matmul_create(&mem_ctx, &dummy_info, &dummy_io_attr);
-        if (ret < 0) mem_ctx = 0;
-    }
-
-    ~rknpu_memory_context() {
-        if (mem_ctx != 0) {
-            rknn_matmul_destroy(mem_ctx);
-        }
-    }
-
-    rknn_matmul_ctx get_ctx() {
-        std::lock_guard<std::mutex> lock(mutex);
-        return mem_ctx;
-    }
-};
-
-static rknpu_memory_context & get_rknpu_memory_context() {
-    static rknpu_memory_context g_mem_ctx;
-    return g_mem_ctx;
-}
 
 
 //
@@ -291,19 +294,20 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     const std::tuple<int, int, int>& key,
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
 ) {
+    UNUSED(matmul_ctx);
     std::lock_guard<std::mutex> lock(backend_ctx->mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
 
-    rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
+    rknn_matmul_ctx mem_ctx = get_rknpu_memory_context().get_ctx();
+    rknn_tensor_mem* mem = rknn_create_mem(mem_ctx, size);
     if (!mem) { return nullptr; }
 
-    auto mem_ctx_for_deleter = get_rknpu_memory_context().get_ctx();
-    auto deleter = [mem_ctx_for_deleter](rknn_tensor_mem* m) {
-        if (m && mem_ctx_for_deleter != 0) {
-            rknn_destroy_mem(mem_ctx_for_deleter, m);
+    auto deleter = [mem_ctx](rknn_tensor_mem* m) {
+        if (m && mem_ctx != 0) {
+            rknn_destroy_mem(mem_ctx, m);
         }
     };
 
@@ -569,8 +573,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             }
 
             size_t type_size_packed;
-            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
-            else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
+            if (w_type == GGML_TYPE_F16) type_size_packed = 2;
+            else if (w_type == GGML_TYPE_Q8_0) type_size_packed = 1;
             else type_size_packed = 0; // INT4
 
             size_t current_offset_in_tensor = 0;
@@ -587,18 +591,20 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             return GGML_STATUS_FAILED;
                         }
 
-                        auto cache_key = std::make_tuple(src0_buffer, total_offset);
-                        std::lock_guard<std::mutex> lock(backend_ctx->mutex);
-                        auto it = backend_ctx->b_mem_handle_cache.find(cache_key);
+                        auto cache_key = std::make_tuple(src0_buf_ctx->dma_buf.fd, total_offset, segment_size_bytes);
+                        auto & global_ctx = get_rknpu_memory_context();
+                        std::lock_guard<std::mutex> lock(global_ctx.mutex);
+                        auto it = global_ctx.b_mem_handle_cache.find(cache_key);
 
-                        if (it != backend_ctx->b_mem_handle_cache.end()) {
+                        if (it != global_ctx.b_mem_handle_cache.end()) {
                             mem_B_segments[i] = it->second;
                         } else {
-                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
+                            rknn_matmul_ctx mem_ctx = global_ctx.mem_ctx;
+                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(mem_ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
                             if (!mem) return GGML_STATUS_FAILED;
-                            auto deleter = [matmul_ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(matmul_ctx->ctx, m); };
+                            auto deleter = [mem_ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(mem_ctx, m); };
                             mem_B_segments[i] = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
-                            backend_ctx->b_mem_handle_cache[cache_key] = mem_B_segments[i];
+                            global_ctx.b_mem_handle_cache[cache_key] = mem_B_segments[i];
                         }
                         RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B_segments[i].get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
                         break;
