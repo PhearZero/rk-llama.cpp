@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <random>
 #include <limits>
 #ifdef __linux__
@@ -498,7 +499,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
-        const bool is_q4_hadamard = false;
         const int K_op = K;
 
         const rknn_matmul_type matmul_type = op_support->mm_type;
@@ -880,6 +880,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    UNUSED(buffer);
     uint8_t* tensor_dma_ptr = (uint8_t*)ggml_rknpu_get_system_ptr(tensor);
     if (!tensor_dma_ptr) {
         return;
