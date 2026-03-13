@@ -121,6 +121,9 @@ struct ggml_backend_rknpu_buffer_context {
     // Per-tensor scale for weights
     std::unordered_map<void *, float> quantized_tensor_scales;
 
+    // Tensors that have been explicitly packed via set_tensor
+    std::unordered_set<void *> packed_tensors;
+
     std::mutex mutex;
     void * base_ptr = nullptr;
     size_t base_ptr_offset = 0;
@@ -419,6 +422,50 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             }
             continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            // Check if src0 is packed. If it's in a view, we check the base tensor.
+            const struct ggml_tensor * src0_base = src0;
+            while (src0_base->view_src != nullptr) src0_base = src0_base->view_src;
+
+            bool is_packed = false;
+            if (src0_base->buffer && src0_base->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
+                auto * src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_base->buffer->context;
+                std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
+                if (src0_buf_ctx->packed_tensors.count(src0_base->data)) {
+                    is_packed = true;
+                }
+            }
+
+            if (!is_packed) {
+                if (backend_ctx->cpu_fallback) {
+                    GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) src0 is not packed, falling back to CPU\n", __func__, i, (int)node->op);
+                    struct ggml_tensor * tmp_nodes[1] = { node };
+                    struct ggml_cgraph temp_graph = {};
+                    temp_graph.n_nodes = 1;
+                    temp_graph.nodes = tmp_nodes;
+
+                    std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
+                    translate_tensor_recursive(node, saved_ptrs);
+
+                    ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+
+                    for (auto & pair : saved_ptrs) {
+                        pair.first->data = pair.second;
+                    }
+
+                    if (status != GGML_STATUS_SUCCESS) {
+                        GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
+                        return status;
+                    }
+                    GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) CPU fallback successful\n", __func__, i, (int)node->op);
+                } else {
+                    GGML_LOG_ERROR("[%s] Node %d: op=%d (MUL_MAT) src0 is not packed and no CPU fallback available\n", __func__, i, (int)node->op);
+                    return GGML_STATUS_FAILED;
+                }
+                continue;
+            }
         }
 
         const auto* op_support = config.find_op_support(w_type);
@@ -760,9 +807,15 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     const auto* op_support = config.find_op_support(tensor->type);
 
     // If there is a specific packing function defined for this tensor type, it's a weight matrix
-    if (op_support && op_support->pack_func) {
+    if (op_support && op_support->pack_func && tensor->view_src == nullptr) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
+
+        // Mark as packed
+        {
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            ctx->packed_tensors.insert(tensor->data);
+        }
 
         if (tensor->type == GGML_TYPE_F16) {
             auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
@@ -783,41 +836,21 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size_bytes);
                 current_write_ptr += segment_packed_size_bytes;
             }
-        // Other quantized types mapping to INT8
-        } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 && ggml_is_quantized(tensor->type)) {
+        // All quantized types mapping to FP16
+        } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16 && ggml_is_quantized(tensor->type)) {
             const size_t n_elements = (size_t)K * N;
             auto traits = ggml_get_type_traits(tensor->type);
             const size_t row_size_bytes = ggml_row_size(tensor->type, K);
 
-            // Finding the global scale without storing the full dequantized matrix.
-            float amax = 0.0f;
-            #pragma omp parallel
-            {
-                std::vector<float> tmp_row(K);
-                #pragma omp for reduction(max:amax)
-                for (int n = 0; n < N; ++n) {
-                    traits->to_float((const uint8_t*)data + (size_t)n * row_size_bytes, tmp_row.data(), K);
-                    for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
-                }
-            }
-
-            const float global_scale_b = amax / 127.0f;
-
-            // Storing it in the buffer context cache
-            {
-                std::lock_guard<std::mutex> lock(ctx->mutex);
-                ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
-            }
-
-            // Dequantizing and re-quantizing directly row-by-row
-            std::vector<int8_t> requantized_data(n_elements);
+            // Dequantizing directly row-by-row to FP16
+            std::vector<uint16_t> fp16_data(n_elements);
             #pragma omp parallel
             {
                 std::vector<float> tmp_row(K);
                 #pragma omp for
                 for (int n = 0; n < N; ++n) {
                     traits->to_float((const uint8_t*)data + (size_t)n * row_size_bytes, tmp_row.data(), K);
-                    rknpu2_quantization::quantize_fp32_to_int8(tmp_row.data(), requantized_data.data() + (size_t)n * K, K, global_scale_b);
+                    rknpu2_quantization::convert_fp32_to_fp16(tmp_row.data(), fp16_data.data() + (size_t)n * K, K);
                 }
             }
 
@@ -828,12 +861,12 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
             for (const auto& seg : segments) {
                 if (seg.size_n == 0) continue;
-                size_t segment_packed_size = (size_t)seg.size_n * K;
+                size_t segment_packed_size = (size_t)seg.size_n * K * sizeof(uint16_t);
                 packed_data_temp.resize(segment_packed_size);
 
                 op_support->pack_func(
                     packed_data_temp.data(),
-                    (const uint8_t*)requantized_data.data(),
+                    (const uint8_t*)fp16_data.data(),
                     K, N, seg.offset_n, seg.size_n
                 );
                 memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
@@ -906,6 +939,10 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
 
+    if (tensor->view_src != nullptr) {
+        return ggml_nbytes(tensor);
+    }
+
     // Getting the current device configuration
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* op_support = config.find_op_support(tensor->type);
@@ -914,18 +951,16 @@ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
 
-        const int padded_K = (tensor->type == GGML_TYPE_Q4_0) ? rknpu2_calibration::next_power_of_two(K) : K;
-
         auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
         size_t total_size = 0;
         for (const auto& seg : segments) {
             if (seg.size_n > 0) {
                 if (op_support->mm_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
-                    total_size += (size_t)seg.size_n * padded_K * 2;
+                    total_size += (size_t)seg.size_n * K * 2;
                 } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
-                    total_size += (size_t)seg.size_n * padded_K;
+                    total_size += (size_t)seg.size_n * K;
                 } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                    total_size += (size_t)seg.size_n * padded_K / 2;
+                    total_size += (size_t)seg.size_n * K / 2;
                 }
             }
         }
