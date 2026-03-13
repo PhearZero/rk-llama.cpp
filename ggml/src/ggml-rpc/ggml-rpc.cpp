@@ -147,6 +147,7 @@ struct rpc_msg_init_tensor_req {
 struct rpc_msg_alloc_buffer_req {
     uint32_t device;
     uint64_t size;
+    uint64_t buffer_id;
 };
 
 struct rpc_msg_alloc_buffer_rsp {
@@ -556,7 +557,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_free_buffer_req request = {ctx->remote_ptr};
+    rpc_msg_free_buffer_req request = {reinterpret_cast<uint64_t>(ctx->base_ptr)};
     rpc_msg_ack ack;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), &ack, sizeof(ack));
     RPC_STATUS_ASSERT(status);
@@ -565,12 +566,6 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    if (ctx->base_ptr != nullptr) {
-        return ctx->base_ptr;
-    }
-    static std::atomic<uintptr_t> dummy_base(0x700000000000ULL);
-    uintptr_t base = dummy_base.fetch_add(0x1000000000ULL); // 64 GB increments
-    ctx->base_ptr = reinterpret_cast<void *>(base);
     return ctx->base_ptr;
 }
 
@@ -604,13 +599,8 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
     if (ggml_tensor_is_rpc(tensor)) {
-        const ggml_tensor * base = tensor;
-        while (base->view_src) {
-            base = base->view_src;
-        }
-        ggml_backend_buffer_t buffer = base->buffer;
-        ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-        result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
+        void * base = ggml_get_tensor_buffer_base(tensor);
+        result.buffer = reinterpret_cast<uint64_t>(base);
     } else {
         result.buffer = 0;
     }
@@ -723,7 +713,7 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
+    rpc_msg_buffer_clear_req request = {reinterpret_cast<uint64_t>(ctx->base_ptr), value};
     rpc_msg_ack ack;
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), &ack, sizeof(ack));
     RPC_STATUS_ASSERT(status);
@@ -748,7 +738,12 @@ static const char * ggml_backend_rpc_buffer_type_name(ggml_backend_buffer_type_t
 
 static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-    rpc_msg_alloc_buffer_req request = {buft_ctx->device, size};
+
+    static std::atomic<uintptr_t> dummy_base(0x700000000000ULL);
+    uintptr_t base = dummy_base.fetch_add(0x1000000000ULL); // 64 GB increments
+    void * base_ptr = reinterpret_cast<void *>(base);
+
+    rpc_msg_alloc_buffer_req request = {buft_ctx->device, size, reinterpret_cast<uint64_t>(base_ptr)};
     rpc_msg_alloc_buffer_rsp response;
     auto sock = get_socket(buft_ctx->endpoint);
     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
@@ -756,7 +751,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, base_ptr, response.remote_ptr},
             response.remote_size);
         return buffer;
     } else {
@@ -1056,7 +1051,7 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
-    std::unordered_set<ggml_backend_buffer_t> buffers;
+    std::unordered_map<uint64_t, ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
 };
@@ -1120,11 +1115,11 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     if (buffer != nullptr) {
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
-            __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        LOG_DBG("[%s] device: %d, size: %" PRIu64 ", buffer_id: %" PRIx64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n",
+            __func__, dev_id, request.size, request.buffer_id, response.remote_ptr, response.remote_size);
+        buffers[request.buffer_id] = buffer;
     } else {
-        LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
+        LOG_DBG("[%s] device: %d, size: %" PRIu64 ", buffer_id: %" PRIx64 " -> failed\n", __func__, dev_id, request.size, request.buffer_id);
     }
     return true;
 }
@@ -1154,37 +1149,38 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 }
 
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
-    LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
-    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    LOG_DBG("[%s] buffer_id: %" PRIx64 "\n", __func__, request.remote_ptr);
+    auto it = buffers.find(request.remote_ptr);
+    if (it == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    ggml_backend_buffer_t buffer = it->second;
     void * base = ggml_backend_buffer_get_base(buffer);
     response.base_ptr = reinterpret_cast<uint64_t>(base);
     return true;
 }
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
-    LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
-    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    LOG_DBG("[%s] buffer_id: %" PRIx64 "\n", __func__, request.remote_ptr);
+    auto it = buffers.find(request.remote_ptr);
+    if (it == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
-    ggml_backend_buffer_free(buffer);
-    buffers.erase(buffer);
+    ggml_backend_buffer_free(it->second);
+    buffers.erase(it);
     return true;
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
-    LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
-    ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
-    if (buffers.find(buffer) == buffers.end()) {
+    LOG_DBG("[%s] buffer_id: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
+    auto it = buffers.find(request.remote_ptr);
+    if (it == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
-    ggml_backend_buffer_clear(buffer, request.value);
+    ggml_backend_buffer_clear(it->second, request.value);
     return true;
 }
 
@@ -1207,9 +1203,12 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
         result->nb[i] = tensor->nb[i];
     }
-    result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
-    if (result->buffer && buffers.find(result->buffer) == buffers.end()) {
-        result->buffer = nullptr;
+    result->buffer = nullptr;
+    if (tensor->buffer != 0) {
+        auto it = buffers.find(tensor->buffer);
+        if (it != buffers.end()) {
+            result->buffer = it->second;
+        }
     }
 
     if (result->buffer) {
@@ -1613,8 +1612,8 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
-    for (auto buffer : buffers) {
-        ggml_backend_buffer_free(buffer);
+    for (auto it : buffers) {
+        ggml_backend_buffer_free(it.second);
     }
 }
 
