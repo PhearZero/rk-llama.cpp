@@ -320,17 +320,35 @@ static void * ggml_rknpu_get_system_ptr(const struct ggml_tensor * tensor) {
     }
 
     auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
-    if (!ctx->base_ptr) return tensor->data;
-
     uintptr_t data_ptr = (uintptr_t)tensor->data;
-    uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
 
+    // Check if data_ptr is already within the DMA buffer's virtual address range
     uintptr_t dma_start = (uintptr_t)ctx->dma_buf.virt_addr;
     uintptr_t dma_end = dma_start + ctx->dma_buf.size;
-    if (data_ptr >= dma_start && data_ptr < dma_end) return (void *)data_ptr;
+    if (data_ptr >= dma_start && data_ptr < dma_end) {
+        return (void *)data_ptr;
+    }
 
-    size_t offset = (data_ptr - base_ptr) + ctx->base_ptr_offset;
-    return (uint8_t *)ctx->dma_buf.virt_addr + offset;
+    // In Protocol v3, tensor->data is a relative offset if it's an RPC tensor.
+    // If it's NOT a pointer in the DMA range, we treat it as a relative offset.
+    // We cap it to buffer size for safety.
+    size_t offset = (size_t)data_ptr;
+    if (offset >= ctx->dma_buf.size) {
+        // This might be an absolute pointer from an incompatible local buffer or old protocol.
+        // We fallback to old heuristic if base_ptr is set.
+        if (ctx->base_ptr) {
+            offset = (data_ptr - (uintptr_t)ctx->base_ptr);
+        }
+    }
+
+    if (offset < ctx->dma_buf.size) {
+        void* ptr = (uint8_t *)ctx->dma_buf.virt_addr + offset;
+        GGML_LOG_DEBUG("[%s] Translated %p to %p (offset %zu) in buffer %s\n",
+                       __func__, (void*)data_ptr, ptr, offset, ctx->name.c_str());
+        return ptr;
+    }
+
+    return (void *)data_ptr;
 }
 
 static void translate_tensor_recursive(struct ggml_tensor * tensor, std::unordered_map<struct ggml_tensor *, void *> & saved_ptrs) {
@@ -713,36 +731,23 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
-    // GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, (void*)tensor->data, offset, size);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("[%s] buffer context is null!\n", __func__);
         return;
     }
+
+    uint8_t* tensor_dma_ptr = (uint8_t*)ggml_rknpu_get_system_ptr(tensor);
+    if (!tensor_dma_ptr) {
+        return;
+    }
+
+    // Safety check against DMA buffer bounds
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
-    uintptr_t data_ptr = (uintptr_t)tensor->data;
-
-    uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
-    // GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
-
-    if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
-        // Fallback or early exit if pointers are not valid
-        if (tensor->data == nullptr && ctx->base_ptr == nullptr && offset == 0 && size <= ctx->dma_buf.size) {
-             // GGML_LOG_INFO("[%s] Performing direct DMA memcpy\n", __func__);
-             memcpy(dma_base, data, size);
-        }
+    if (tensor_dma_ptr < dma_base || tensor_dma_ptr + offset + size > dma_base + ctx->dma_buf.size) {
+        GGML_LOG_ERROR("[%s] out of bounds: ptr=%p, offset=%zu, size=%zu, dma_base=%p, dma_size=%zu\n",
+                       __func__, (void*)tensor_dma_ptr, offset, size, (void*)dma_base, ctx->dma_buf.size);
         return;
     }
-
-    size_t tensor_offset_in_buffer = (data_ptr - base_ptr) + ctx->base_ptr_offset;
-    if (tensor_offset_in_buffer + size > ctx->dma_buf.size) {
-        GGML_LOG_ERROR("[%s] tensor_offset_in_buffer (%zu) + size (%zu) > dma_buf.size (%zu)\n",
-                       __func__, tensor_offset_in_buffer, size, ctx->dma_buf.size);
-        // We should probably fail here or use a safer offset.
-        // For now, let's try to clamp it if it's just a small misalignment, but here it seems more fundamental.
-        return;
-    }
-
-    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
     // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
 
     // Getting the current device configuration to drive the packing logic
@@ -842,28 +847,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
-    uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
-    uintptr_t data_ptr = (uintptr_t)tensor->data;
-    uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
-
-    if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
-        // Fallback or early exit if pointers are not valid
-        if (tensor->data == nullptr && ctx->base_ptr == nullptr && offset == 0 && size <= ctx->dma_buf.size) {
-            memcpy(data, dma_base, size);
-        }
+    uint8_t* tensor_dma_ptr = (uint8_t*)ggml_rknpu_get_system_ptr(tensor);
+    if (!tensor_dma_ptr) {
         return;
     }
-
-    size_t tensor_offset_in_buffer = (data_ptr - base_ptr) + ctx->base_ptr_offset;
-    if (tensor_offset_in_buffer + size > ctx->dma_buf.size) {
-        GGML_LOG_ERROR("[%s] tensor_offset_in_buffer (%zu) + size (%zu) > dma_buf.size (%zu)\n",
-                       __func__, tensor_offset_in_buffer, size, ctx->dma_buf.size);
-        return;
-    }
-
-    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
-    // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
