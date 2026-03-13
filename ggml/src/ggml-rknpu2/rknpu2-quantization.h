@@ -25,6 +25,14 @@ namespace rknpu2_quantization {
 void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements);
 
 /**
+ * @brief Converts a row of FP16 values to FP32.
+ * @param src Pointer to the source FP16 (uint16_t) data.
+ * @param dst Pointer to the destination FP32 data.
+ * @param n_elements The number of elements to convert.
+ */
+void convert_fp16_to_fp32(const uint16_t * src, float * dst, size_t n_elements);
+
+/**
  * @brief Symmetrically quantizes a row of FP32 values to INT8.
  *
  * The quantization formula is: `dst[i] = round(src[i] / scale)`.

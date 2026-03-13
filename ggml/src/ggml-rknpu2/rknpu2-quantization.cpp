@@ -25,6 +25,22 @@ void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements) 
     }
 }
 
+void convert_fp16_to_fp32(const uint16_t * src, float * dst, size_t n_elements) {
+    size_t i = 0;
+#ifdef __ARM_NEON
+    for (; i + 7 < n_elements; i += 8) {
+        float16x8_t f16_vec = (float16x8_t)vld1q_u16(src + i);
+        float32x4_t f32_vec_0 = vcvt_f32_f16(vget_low_f16(f16_vec));
+        float32x4_t f32_vec_1 = vcvt_f32_f16(vget_high_f16(f16_vec));
+        vst1q_f32(dst + i, f32_vec_0);
+        vst1q_f32(dst + i + 4, f32_vec_1);
+    }
+#endif
+    for (; i < n_elements; ++i) {
+        dst[i] = GGML_FP16_TO_FP32(src[i]);
+    }
+}
+
 void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale) {
     const float iscale = (scale == 0.0f) ? 0.0f : 1.0f / scale;
     for (size_t i = 0; i < n_elements; ++i) {
