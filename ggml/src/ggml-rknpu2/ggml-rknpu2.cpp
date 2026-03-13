@@ -122,6 +122,7 @@ struct ggml_backend_rknpu_buffer_context {
 
     std::mutex mutex;
     void * base_ptr = nullptr;
+    size_t base_ptr_offset = 0;
 };
 
 // RKNN matmul operation context
@@ -589,15 +590,28 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     std::lock_guard<std::mutex> lock(ctx->mutex);
-    if (ctx->base_ptr == nullptr && tensor->view_src == nullptr) {
-        ctx->base_ptr = tensor->data;
+
+    if (tensor->view_src != nullptr) {
+        return GGML_STATUS_SUCCESS;
     }
+
+    // Use a heuristic to identify the tensor that should be at the base of the buffer.
+    // In RPC, tensors are often initialized in an order that doesn't correspond to their memory addresses.
+    // We assume that the tensor with the lowest data address is the base of the buffer.
+    uintptr_t data_ptr = (uintptr_t)tensor->data;
+    if (ctx->base_ptr == nullptr || data_ptr < (uintptr_t)ctx->base_ptr) {
+        ctx->base_ptr = tensor->data;
+        // In some cases, the "base" tensor might not be at offset 0 of the buffer.
+        // But for now, we assume it is.
+        ctx->base_ptr_offset = 0;
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
-    GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, data, offset, size);
+    // GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, data, offset, size);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("[%s] buffer context is null!\n", __func__);
         return;
@@ -605,18 +619,28 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
     uintptr_t data_ptr = (uintptr_t)tensor->data;
     uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
-    GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
+    // GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
 
     if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
         // Fallback or early exit if pointers are not valid
         if (tensor->data == nullptr && ctx->base_ptr == nullptr && offset == 0 && size <= ctx->dma_buf.size) {
-             GGML_LOG_INFO("[%s] Performing direct DMA memcpy\n", __func__);
+             // GGML_LOG_INFO("[%s] Performing direct DMA memcpy\n", __func__);
              memcpy(dma_base, data, size);
         }
         return;
     }
-    uint8_t* tensor_dma_ptr = dma_base + (data_ptr - base_ptr);
-    GGML_LOG_INFO("[%s] tensor_dma_ptr: %p\n", __func__, (void*)tensor_dma_ptr);
+
+    size_t tensor_offset_in_buffer = (data_ptr - base_ptr) + ctx->base_ptr_offset;
+    if (tensor_offset_in_buffer + size > ctx->dma_buf.size) {
+        GGML_LOG_ERROR("[%s] tensor_offset_in_buffer (%zu) + size (%zu) > dma_buf.size (%zu)\n",
+                       __func__, tensor_offset_in_buffer, size, ctx->dma_buf.size);
+        // We should probably fail here or use a safer offset.
+        // For now, let's try to clamp it if it's just a small misalignment, but here it seems more fundamental.
+        return;
+    }
+
+    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
+    // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p\n", __func__, (void*)tensor_dma_ptr);
 
     // Getting the current device configuration to drive the packing logic
     auto& config_manager = rknpu2_configuration::Rknpu2ConfigManager::get_instance();
