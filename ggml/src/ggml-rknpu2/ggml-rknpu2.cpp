@@ -88,22 +88,22 @@ static std::vector<MatrixSegment> compute_matrix_segments(int N, int num_cores, 
 
     int base_segment_size = (N / num_cores / alignment) * alignment;
     int remaining = N - (base_segment_size * num_cores);
-    
+
     int offset = 0;
     for (int i = 0; i < num_cores; i++) {
         MatrixSegment seg;
         seg.offset_n = offset;
         seg.size_n = base_segment_size;
         seg.core_id = i;
-        
+
         if (i < remaining / alignment) {
             seg.size_n += alignment;
         }
-        
+
         offset += seg.size_n;
         segments.push_back(seg);
     }
-    
+
     return segments;
 }
 
@@ -115,10 +115,10 @@ struct ggml_backend_rknpu_buffer_context {
     std::string name;
 
     // Per-tensor scale for weights
-    std::unordered_map<const struct ggml_tensor *, float> quantized_tensor_scales;
+    std::unordered_map<void *, float> quantized_tensor_scales;
 
     // Per-tensor random sign vector for Hadamard Transform
-    std::unordered_map<const struct ggml_tensor *, std::vector<float>> hadamard_s_vectors;
+    std::unordered_map<void *, std::vector<float>> hadamard_s_vectors;
 
     std::mutex mutex;
 };
@@ -350,7 +350,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         auto& matmul_ctx = matmul_ctxs[i];
                         size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
                         size_t total_offset = src0_base_offset_in_dma + current_offset_in_tensor;
-                        
+
                         auto cache_key = std::make_pair(src0_buffer, total_offset);
                         std::lock_guard<std::mutex> lock(backend_ctx->mutex);
                         auto it = backend_ctx->b_mem_handle_cache.find(cache_key);
@@ -421,7 +421,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     std::vector<float> s_vec;
                     {
                         std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-                        auto it = src0_buf_ctx->hadamard_s_vectors.find(src0);
+                        auto it = src0_buf_ctx->hadamard_s_vectors.find(src0->data);
                         GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
                         s_vec = it->second;
                     }
@@ -455,7 +455,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
                 {
                     std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-                    auto it = src0_buf_ctx->quantized_tensor_scales.find(src0);
+                    auto it = src0_buf_ctx->quantized_tensor_scales.find(src0->data);
                     GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scale not found");
                     scale_B = it->second;
                 }
@@ -471,7 +471,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 4. Preparing C-matrix ==========
         // ===========================================
-        {            
+        {
             for (size_t i = 0; i < num_active_segments; i++) {
                 auto& matmul_ctx = matmul_ctxs[i];
                 auto cache_key = std::make_tuple(M, active_segments[i].size_n, active_segments[i].core_id);
@@ -484,7 +484,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ==========================================
         // ========== 5. Running operation ==========
         // ==========================================
-        {            
+        {
             #pragma omp parallel for num_threads(num_active_segments)
             for (size_t i = 0; i < num_active_segments; i++) {
                 int ret = rknn_matmul_run(matmul_ctxs[i]->ctx);
@@ -499,7 +499,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         {
             float* dst_data = (float*)dst->data;
-            
+
             for (size_t i = 0; i < num_active_segments; i++) {
                 RKNN_CHECK(rknn_mem_sync(matmul_ctxs[i]->ctx, mem_C_segments[i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
             }
@@ -548,7 +548,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         }
                         break;
                     }
-                    
+
                     default:
                         // This should not be reached if config is correct
                         break;
@@ -637,7 +637,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             // Storing it in the buffer context cache
             {
                 std::lock_guard<std::mutex> lock(ctx->mutex);
-                ctx->quantized_tensor_scales[tensor] = global_scale_b;
+                ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
             }
 
             // Dequantizing and re-quantizing directly row-by-row
@@ -686,7 +686,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 // Padding K and generating the random sign vector 's'
                 const int padded_K = rknpu2_calibration::next_power_of_two(K);
                 std::vector<float> s_vec(padded_K);
-                std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor));
+                std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor->data));
                 std::uniform_int_distribution<int> distrib(0, 1);
                 for(int k = 0; k < padded_K; ++k) {
                     s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
@@ -695,7 +695,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 // Storing the vector for use during activation processing
                 {
                     std::lock_guard<std::mutex> lock(ctx->mutex);
-                    ctx->hadamard_s_vectors[tensor] = s_vec;
+                    ctx->hadamard_s_vectors[tensor->data] = s_vec;
                 }
 
                 // Rotating the FP32 weight matrix using padding
@@ -705,7 +705,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 for (int n = 0; n < N; ++n) {
                     const float* src_row = dequantized_data.data() + (size_t)n * K;
                     float* dst_row_rot = rotated_b_fp32.data() + (size_t)n * padded_K;
-                    
+
                     std::vector<float> signed_row(K);
                     for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
 
@@ -993,7 +993,7 @@ static ggml_backend_t ggml_backend_rknpu_device_init_backend(ggml_backend_dev_t 
     if (!rknpu2_configuration::Rknpu2ConfigManager::get_instance().select_device("RK3588")) return NULL;
 
     ggml_backend_rknpu_context * ctx = new ggml_backend_rknpu_context();
-    
+
     static const struct ggml_backend_i rknpu_backend_interface = {
         /* .get_name           = */ ggml_backend_rknpu_name,
         /* .free               = */ ggml_backend_rknpu_free,
@@ -1041,7 +1041,7 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
     if (index != 0) {
         return NULL;
     }
-    
+
     static const struct ggml_backend_buffer_type_i rknpu_buffer_type_interface = {
         /* .get_name       = */ ggml_backend_rknpu_buffer_type_get_name,
         /* .alloc_buffer   = */ ggml_backend_rknpu_buffer_type_alloc_buffer,
@@ -1080,7 +1080,7 @@ static ggml_backend_dev_t ggml_backend_rknpu_reg_get_device(ggml_backend_reg_t r
         /* .reg     = */ reg,
         /* .context = */ NULL,
     };
-    
+
     if (rknpu_buffer_type.device == NULL) {
         rknpu_buffer_type.device = &rknpu_device;
     }
