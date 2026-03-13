@@ -2,7 +2,9 @@
 
 #include "rknpu2-configuration.h"
 
+#ifdef __ARM_NEON
 #include <arm_neon.h>
+#endif
 
 // --- Anonymous namespace for chip-specific packing functions ---
 
