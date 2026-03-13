@@ -672,13 +672,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     uint16_t* dst_ptr = (uint16_t*)dst_base;
                     #pragma omp parallel for
                     for (int m = 0; m < M; ++m) {
+                        uint16_t* dst_row = dst_ptr + (size_t)m * K_op;
+                        if (K_op > K) {
+                            memset(dst_row + K, 0, (K_op - K) * sizeof(uint16_t));
+                        }
                         if (src1->type == GGML_TYPE_F32) {
                             const float* src_row = (const float*)src1_data + (size_t)m * row_stride;
-                            uint16_t* dst_row = dst_ptr + (size_t)m * K;
                             rknpu2_quantization::convert_fp32_to_fp16(src_row, dst_row, K);
                         } else if (src1->type == GGML_TYPE_F16) {
                             const uint16_t* src_row = (const uint16_t*)src1_data + (size_t)m * row_stride;
-                            uint16_t* dst_row = dst_ptr + (size_t)m * K;
                             memcpy(dst_row, src_row, K * sizeof(uint16_t));
                         }
                     }
@@ -690,7 +692,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     #pragma omp parallel for
                     for (int m = 0; m < M; ++m) {
                         float amax_m = 0.0f;
-                        int8_t* dst_row = dst_ptr + (size_t)m * K;
+                        int8_t* dst_row = dst_ptr + (size_t)m * K_op;
+                        if (K_op > K) {
+                            memset(dst_row + K, 0, (K_op - K) * sizeof(int8_t));
+                        }
 
                         if (src1->type == GGML_TYPE_F32) {
                             const float* src_row = (const float*)src1_data + (size_t)m * row_stride;
@@ -1313,12 +1318,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             }
 
             // Checking contiguous memory
-            // Note: src1 might be a view (KV cache), so we check the rows specifically during execution.
-            // But for RKNPU, we currently require contiguous memory for the whole tensor if we offload it.
-            // Actually, MUL_MAT on RKNPU works on M x K activations.
-            // If it's a view, ggml_is_contiguous(src1) might be false even if it's "mostly" contiguous.
-            // Let's allow non-contiguous src1 and handle it in graph_compute.
-            if (!ggml_is_contiguous(src0)) {
+            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
                 return false;
             }
 
