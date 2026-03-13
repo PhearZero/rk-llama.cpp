@@ -28,6 +28,9 @@
 #include <unordered_map>
 #include <random>
 #include <limits>
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#endif
 
 #define UNUSED(x) (void)(x)
 
@@ -319,6 +322,44 @@ static std::vector<float> get_hadamard_s_vector(ggml_backend_rknpu_buffer_contex
     return s_vec;
 }
 
+static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer);
+
+static void * ggml_rknpu_get_system_ptr(const struct ggml_tensor * tensor) {
+    if (!tensor || !tensor->data) return nullptr;
+
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    if (!buffer) return tensor->data;
+
+    if (buffer->iface.get_base != ggml_backend_rknpu_buffer_get_base) {
+        return tensor->data;
+    }
+
+    auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+    if (!ctx->base_ptr) return tensor->data;
+
+    uintptr_t data_ptr = (uintptr_t)tensor->data;
+    uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
+
+    uintptr_t dma_start = (uintptr_t)ctx->dma_buf.virt_addr;
+    uintptr_t dma_end = dma_start + ctx->dma_buf.size;
+    if (data_ptr >= dma_start && data_ptr < dma_end) return (void *)data_ptr;
+
+    size_t offset = (data_ptr - base_ptr) + ctx->base_ptr_offset;
+    return (uint8_t *)ctx->dma_buf.virt_addr + offset;
+}
+
+static void translate_tensor_recursive(struct ggml_tensor * tensor, std::unordered_map<struct ggml_tensor *, void *> & saved_ptrs) {
+    if (!tensor || saved_ptrs.count(tensor)) return;
+
+    saved_ptrs[tensor] = tensor->data;
+    tensor->data = ggml_rknpu_get_system_ptr(tensor);
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        translate_tensor_recursive(tensor->src[i], saved_ptrs);
+    }
+    translate_tensor_recursive(tensor->view_src, saved_ptrs);
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -353,7 +394,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 struct ggml_cgraph temp_graph = {};
                 temp_graph.n_nodes = 1;
                 temp_graph.nodes[0] = node;
+
+                std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
+                translate_tensor_recursive(node, saved_ptrs);
+
                 ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+
+                for (auto & pair : saved_ptrs) {
+                    pair.first->data = pair.second;
+                }
+
                 if (status != GGML_STATUS_SUCCESS) {
                     GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
                     return status;
@@ -369,7 +419,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 struct ggml_cgraph temp_graph = {};
                 temp_graph.n_nodes = 1;
                 temp_graph.nodes[0] = node;
+
+                std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
+                translate_tensor_recursive(node, saved_ptrs);
+
                 ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+
+                for (auto & pair : saved_ptrs) {
+                    pair.first->data = pair.second;
+                }
+
                 if (status != GGML_STATUS_SUCCESS) {
                     GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
                     return status;
@@ -1070,8 +1129,19 @@ static const char * ggml_backend_rknpu_device_get_description(ggml_backend_dev_t
 
 static void ggml_backend_rknpu_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {
     UNUSED(dev);
+#ifdef __linux__
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        *total = (size_t)si.totalram * si.mem_unit;
+        *free = (size_t)si.freeram * si.mem_unit;
+    } else {
+        *free = 0;
+        *total = 0;
+    }
+#else
     *free = 0;
     *total = 0;
+#endif
 }
 
 static enum ggml_backend_dev_type ggml_backend_rknpu_device_get_type(ggml_backend_dev_t dev) {
