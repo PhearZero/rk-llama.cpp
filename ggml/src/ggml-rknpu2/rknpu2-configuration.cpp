@@ -34,6 +34,7 @@ void pack_B_rk3588_fp16(
                 const uint16_t * src_ptr = src + n_global * K + j * 32;
                 uint16_t * dst_ptr = dst + dst_block + ii * s2;
 
+#ifdef __ARM_NEON
                 uint16x8_t d0 = vld1q_u16(src_ptr + 0);
                 uint16x8_t d1 = vld1q_u16(src_ptr + 8);
                 uint16x8_t d2 = vld1q_u16(src_ptr + 16);
@@ -43,6 +44,11 @@ void pack_B_rk3588_fp16(
                 vst1q_u16(dst_ptr + 8, d1);
                 vst1q_u16(dst_ptr + 16, d2);
                 vst1q_u16(dst_ptr + 24, d3);
+#else
+                for (int k = 0; k < 32; ++k) {
+                    dst_ptr[k] = src_ptr[k];
+                }
+#endif
             }
         }
     }
@@ -72,11 +78,17 @@ void pack_B_rk3588_int8(
                 const int8_t* src_ptr = src + n_global * K + j * 32;
                 int8_t* dst_ptr = dst + dst_block + ii * s2;
 
+#ifdef __ARM_NEON
                 int8x16_t d0 = vld1q_s8(src_ptr);
                 int8x16_t d1 = vld1q_s8(src_ptr + 16);
 
                 vst1q_s8(dst_ptr, d0);
                 vst1q_s8(dst_ptr + 16, d1);
+#else
+                for (int k = 0; k < 32; ++k) {
+                    dst_ptr[k] = src_ptr[k];
+                }
+#endif
             }
         }
     }
@@ -105,8 +117,14 @@ void pack_B_rk3588_int4(
                 const uint8_t* src_ptr = src + n_global * src_row_stride_bytes + (j * 32) / 2;
                 uint8_t* dst_ptr = dst + dst_block + ii * s2;
 
+#ifdef __ARM_NEON
                 uint8x16_t d0 = vld1q_u8(src_ptr);
                 vst1q_u8(dst_ptr, d0);
+#else
+                for (int k = 0; k < 16; ++k) {
+                    dst_ptr[k] = src_ptr[k];
+                }
+#endif
             }
         }
     }

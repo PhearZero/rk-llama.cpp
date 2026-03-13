@@ -31,6 +31,7 @@
 #include <unordered_set>
 #include <random>
 #include <limits>
+#include <thread>
 #ifdef __linux__
 #include <sys/sysinfo.h>
 #endif
@@ -581,7 +582,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         } else {
                             rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
                             if (!mem) {
-                                GGML_LOG_ERROR("[%s] rknn_create_mem_from_fd failed for Node %d Step 2 (size=%zu, offset=%zu)\n", __func__, i, segment_size_bytes, total_offset);
+                                GGML_LOG_ERROR("[%s] rknn_create_mem_from_fd failed for Node %zu Step 2 (size=%zu, offset=%zu)\n", __func__, i, segment_size_bytes, total_offset);
                                 // Try to clear cache and retry once
                                 {
                                     std::lock_guard<std::mutex> lock2(backend_ctx->mutex);
