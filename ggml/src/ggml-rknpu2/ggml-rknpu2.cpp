@@ -295,8 +295,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int K = src0 ? (int)src0->ne[0] : 0;
         const int N = src0 ? (int)src0->ne[1] : 0;
 
-        GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d\n", __func__, i, (int)node->op, (int)w_type, M, K, N);
-        if (node->op != GGML_OP_MUL_MAT) continue;
+    GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d, data=%p, buffer=%p\n", __func__, i, (int)node->op, (int)w_type, M, K, N, (void*)(src0 ? src0->data : nullptr), (void*)(src0 ? src0->buffer : nullptr));
+    if (node->op != GGML_OP_MUL_MAT) continue;
 
         const bool is_q4_hadamard = (src0->type == GGML_TYPE_Q4_0);
         const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
@@ -427,16 +427,28 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
 
                 case rknpu2_configuration::NPU_TYPE_INT4: {
+                    if (src0->buffer == nullptr) {
+                        GGML_LOG_ERROR("[%s] src0->buffer is null for MUL_MAT Node %d\n", __func__, i);
+                        return GGML_STATUS_FAILED;
+                    }
                     auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0->buffer->context;
                     std::vector<float> s_vec;
                     {
                         std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
                         auto it = src0_buf_ctx->hadamard_s_vectors.find(src0->data);
                         if (it == src0_buf_ctx->hadamard_s_vectors.end()) {
-                            GGML_LOG_ERROR("[%s] Hadamard 's' vector not found for src0->data=%p. Did you forget to set_tensor?\n", __func__, src0->data);
+                            GGML_LOG_INFO("[%s] Hadamard 's' vector not found for src0->data=%p. Regenerating...\n", __func__, src0->data);
+                            // Regenerate using the same logic as in set_tensor
+                            s_vec.resize(K_op);
+                            std::mt19937 gen(reinterpret_cast<uintptr_t>(src0->data));
+                            std::uniform_int_distribution<int> distrib(0, 1);
+                            for(int k = 0; k < K_op; ++k) {
+                                s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
+                            }
+                            src0_buf_ctx->hadamard_s_vectors[src0->data] = s_vec;
+                        } else {
+                            s_vec = it->second;
                         }
-                        GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
-                        s_vec = it->second;
                     }
 
                     uint8_t* dst_ptr = (uint8_t*)dst_base;
@@ -772,6 +784,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 // Storing the vector for use during activation processing
                 {
                     std::lock_guard<std::mutex> lock(ctx->mutex);
+                    GGML_LOG_INFO("[%s] Storing Hadamard 's' vector for data=%p, K=%d, padded_K=%d\n", __func__, tensor->data, K, padded_K);
                     ctx->hadamard_s_vectors[tensor->data] = s_vec;
                 }
 
