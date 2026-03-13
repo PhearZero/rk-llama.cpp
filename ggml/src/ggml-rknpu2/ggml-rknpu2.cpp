@@ -38,7 +38,6 @@
 
 #define UNUSED(x) (void)(x)
 
-#define RKNN_MAX_CACHE_SIZE 1024
 
 // Macro for RKNN API calls
 #define RKNN_CHECK(stmt, msg)                                           \
@@ -296,10 +295,6 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
-    }
-
-    if (cache.size() >= RKNN_MAX_CACHE_SIZE) {
-        cache.clear();
     }
 
     rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
@@ -599,13 +594,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         if (it != backend_ctx->b_mem_handle_cache.end()) {
                             mem_B_segments[i] = it->second;
                         } else {
-                            if (backend_ctx->b_mem_handle_cache.size() >= RKNN_MAX_CACHE_SIZE) {
-                                backend_ctx->b_mem_handle_cache.clear();
-                            }
                             rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
                             if (!mem) return GGML_STATUS_FAILED;
-                            auto mem_ctx_for_deleter = get_rknpu_memory_context().get_ctx();
-                            auto deleter = [mem_ctx_for_deleter](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(mem_ctx_for_deleter, m); };
+                            auto deleter = [matmul_ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(matmul_ctx->ctx, m); };
                             mem_B_segments[i] = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
                             backend_ctx->b_mem_handle_cache[cache_key] = mem_B_segments[i];
                         }
@@ -665,7 +656,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
 
                 case rknpu2_configuration::NPU_TYPE_INT4: {
-                    int8_t* dst_ptr = (int8_t*)dst_base;
+                    uint8_t* dst_ptr = (uint8_t*)dst_base;
                     const int padded_K = rknpu2_calibration::next_power_of_two(K);
                     ggml_backend_buffer_t src0_buffer = src0->buffer;
                     auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
@@ -677,6 +668,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         #pragma omp for
                         for (int m = 0; m < M; ++m) {
                             const float* src_row = x + (size_t)m * row_stride;
+                            memset(tmp_row.data(), 0, padded_K * sizeof(float));
                             memcpy(tmp_row.data(), src_row, K * sizeof(float));
                             // Multiply by random sign vector
                             for (int k = 0; k < padded_K; ++k) tmp_row[k] *= s_vec[k];
@@ -685,10 +677,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                             float amax_m = 0.0f;
                             for (int k = 0; k < padded_K; ++k) amax_m = std::max(amax_m, std::abs(tmp_row[k]));
-                            scales_A[m] = amax_m / 127.0f;
+                            scales_A[m] = amax_m / 7.0f;
 
-                            int8_t* dst_row = dst_ptr + (size_t)m * padded_K;
-                            rknpu2_quantization::quantize_fp32_to_int8(tmp_row.data(), dst_row, padded_K, scales_A[m]);
+                            uint8_t* dst_row = dst_ptr + (size_t)m * (padded_K / 2);
+                            rknpu2_quantization::quantize_fp32_to_int4_packed(tmp_row.data(), dst_row, padded_K, scales_A[m]);
                         }
                     }
                     break;
