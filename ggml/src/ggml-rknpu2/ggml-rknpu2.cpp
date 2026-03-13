@@ -597,21 +597,34 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
+    GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, data, offset, size);
+    if (ctx == nullptr) {
+        GGML_LOG_ERROR("[%s] buffer context is null!\n", __func__);
+        return;
+    }
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
     uintptr_t data_ptr = (uintptr_t)tensor->data;
     uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
+    GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
 
     if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
         // Fallback or early exit if pointers are not valid
         if (tensor->data == nullptr && ctx->base_ptr == nullptr && offset == 0 && size <= ctx->dma_buf.size) {
+             GGML_LOG_INFO("[%s] Performing direct DMA memcpy\n", __func__);
              memcpy(dma_base, data, size);
         }
         return;
     }
     uint8_t* tensor_dma_ptr = dma_base + (data_ptr - base_ptr);
+    GGML_LOG_INFO("[%s] tensor_dma_ptr: %p\n", __func__, (void*)tensor_dma_ptr);
 
     // Getting the current device configuration to drive the packing logic
-    const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
+    auto& config_manager = rknpu2_configuration::Rknpu2ConfigManager::get_instance();
+    const auto& config = config_manager.get_current_config();
+    if (config.device_name == "NONE") {
+        GGML_LOG_ERROR("[%s] No device configuration found!\n", __func__);
+        return;
+    }
     const auto* op_support = config.find_op_support(tensor->type);
 
     // If there is a specific packing function defined for this tensor type, it's a weight matrix

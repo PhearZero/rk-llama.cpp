@@ -28,7 +28,7 @@ void pack_B_rk3588_fp16(
             const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
             for (int ii = 0; ii < 16; ++ii) {
                 const size_t n_global = (size_t)n_offset + (size_t)i * 16 + (size_t)ii;
-                
+
                 const uint16_t * src_ptr = src + n_global * K + j * 32;
                 uint16_t * dst_ptr = dst + dst_block + ii * s2;
 
@@ -90,7 +90,7 @@ void pack_B_rk3588_int4(
 
     const size_t s0 = (size_t)(K / 32) * 64 * (32 / 2);
     const size_t s1 = 64 * (32 / 2);
-    const size_t s2 = (32 / 2); 
+    const size_t s2 = (32 / 2);
 
     const size_t src_row_stride_bytes = (size_t)K / 2;
 
@@ -185,7 +185,10 @@ bool Rknpu2ConfigManager::select_device(const std::string& device_name) {
 }
 
 const Rknpu2DeviceConfig& Rknpu2ConfigManager::get_current_config() const {
-    GGML_ASSERT(current_config != nullptr && "No device configuration selected or available.");
+    static Rknpu2DeviceConfig empty_config = {"NONE", 0, {}};
+    if (current_config == nullptr) {
+        return empty_config;
+    }
     return *current_config;
 }
 
