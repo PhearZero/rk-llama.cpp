@@ -399,6 +399,25 @@ static void translate_tensor_recursive(struct ggml_tensor * tensor, std::unorder
     translate_tensor_recursive(tensor->view_src, saved_ptrs);
 }
 
+static void sync_tensor_recursive(struct ggml_tensor * tensor, rknn_mem_sync_mode direction, std::unordered_set<struct ggml_tensor *> & synced_tensors) {
+    if (!tensor || synced_tensors.count(tensor)) return;
+    synced_tensors.insert(tensor);
+
+    if (tensor->buffer && tensor->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
+        auto * buf_ctx = (ggml_backend_rknpu_buffer_context *)tensor->buffer->context;
+        rknn_tensor_mem mem = {};
+        mem.virt_addr = buf_ctx->dma_buf.virt_addr;
+        mem.fd = buf_ctx->dma_buf.fd;
+        mem.size = buf_ctx->dma_buf.size;
+        rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, direction);
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        sync_tensor_recursive(tensor->src[i], direction, synced_tensors);
+    }
+    sync_tensor_recursive(tensor->view_src, direction, synced_tensors);
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -442,7 +461,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
                 translate_tensor_recursive(node, saved_ptrs);
 
+                std::unordered_set<struct ggml_tensor *> synced_tensors;
+                sync_tensor_recursive(node, RKNN_MEMORY_SYNC_FROM_DEVICE, synced_tensors);
+
                 ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+
+                synced_tensors.clear();
+                sync_tensor_recursive(node, RKNN_MEMORY_SYNC_TO_DEVICE, synced_tensors);
 
                 for (auto & pair : saved_ptrs) {
                     pair.first->data = pair.second;
@@ -486,7 +511,13 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
                     translate_tensor_recursive(node, saved_ptrs);
 
+                    std::unordered_set<struct ggml_tensor *> synced_tensors;
+                    sync_tensor_recursive(node, RKNN_MEMORY_SYNC_FROM_DEVICE, synced_tensors);
+
                     ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+
+                    synced_tensors.clear();
+                    sync_tensor_recursive(node, RKNN_MEMORY_SYNC_TO_DEVICE, synced_tensors);
 
                     for (auto & pair : saved_ptrs) {
                         pair.first->data = pair.second;
