@@ -720,10 +720,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size_bytes);
                 current_write_ptr += segment_packed_size_bytes;
             }
-        // GGML_TYPE_Q8_0
-        } else if (tensor->type == GGML_TYPE_Q8_0) {
-            const block_q8_0* src_blocks = (const block_q8_0*)data;
+        // Quantized types mapping to INT8
+        } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 && ggml_is_quantized(tensor->type)) {
             const size_t n_elements = (size_t)K * N;
+            auto traits = ggml_get_type_traits(tensor->type);
+            const size_t row_size_bytes = ggml_row_size(tensor->type, K);
 
             // Finding the global scale without storing the full dequantized matrix.
             float amax = 0.0f;
@@ -732,7 +733,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 std::vector<float> tmp_row(K);
                 #pragma omp for reduction(max:amax)
                 for (int n = 0; n < N; ++n) {
-                    dequantize_row_q8_0(src_blocks + (size_t)n * (K / QK8_0), tmp_row.data(), K);
+                    traits->to_float((const uint8_t*)data + (size_t)n * row_size_bytes, tmp_row.data(), K);
                     for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
                 }
             }
@@ -752,7 +753,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 std::vector<float> tmp_row(K);
                 #pragma omp for
                 for (int n = 0; n < N; ++n) {
-                    dequantize_row_q8_0(src_blocks + (size_t)n * (K / QK8_0), tmp_row.data(), K);
+                    traits->to_float((const uint8_t*)data + (size_t)n * row_size_bytes, tmp_row.data(), K);
                     rknpu2_quantization::quantize_fp32_to_int8(tmp_row.data(), requantized_data.data() + (size_t)n * K, K, global_scale_b);
                 }
             }
