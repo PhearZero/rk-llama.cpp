@@ -718,7 +718,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
                 {
                     std::lock_guard<std::mutex> lock(ctx->mutex);
-                    ctx->quantized_tensor_scales[tensor] = global_scale_b;
+                    ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
                 }
 
                 // Quantizing data to INT4
@@ -770,7 +770,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 // Storing it in the buffer context cache
                 {
                     std::lock_guard<std::mutex> lock(ctx->mutex);
-                    ctx->quantized_tensor_scales[tensor] = global_scale_b;
+                    ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
                 }
 
                 // Dequantizing and re-quantizing directly row-by-row
