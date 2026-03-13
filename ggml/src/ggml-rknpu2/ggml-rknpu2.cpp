@@ -277,6 +277,35 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     return mem_shared;
 }
 
+static float get_quantized_scale(ggml_backend_rknpu_buffer_context* ctx, const struct ggml_tensor* tensor) {
+    const struct ggml_tensor* base = tensor;
+    while (base->view_src != nullptr) base = base->view_src;
+
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    auto it = ctx->quantized_tensor_scales.find(base->data);
+    if (it != ctx->quantized_tensor_scales.end()) return it->second;
+    return 1.0f;
+}
+
+static std::vector<float> get_hadamard_s_vector(ggml_backend_rknpu_buffer_context* ctx, const struct ggml_tensor* tensor, int K_op) {
+    const struct ggml_tensor* base = tensor;
+    while (base->view_src != nullptr) base = base->view_src;
+
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    auto it = ctx->hadamard_s_vectors.find(base->data);
+    if (it != ctx->hadamard_s_vectors.end()) return it->second;
+
+    // Regenerate if missing
+    std::vector<float> s_vec(K_op);
+    std::mt19937 gen(reinterpret_cast<uintptr_t>(base->data));
+    std::uniform_int_distribution<int> distrib(0, 1);
+    for(int k = 0; k < K_op; ++k) {
+        s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
+    }
+    ctx->hadamard_s_vectors[base->data] = s_vec;
+    return s_vec;
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
@@ -453,24 +482,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         return GGML_STATUS_FAILED;
                     }
                     auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0->buffer->context;
-                    std::vector<float> s_vec;
-                    {
-                        std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-                        auto it = src0_buf_ctx->hadamard_s_vectors.find(src0->data);
-                        if (it == src0_buf_ctx->hadamard_s_vectors.end()) {
-                            GGML_LOG_INFO("[%s] Hadamard 's' vector not found for src0->data=%p. Regenerating...\n", __func__, src0->data);
-                            // Regenerate using the same logic as in set_tensor
-                            s_vec.resize(K_op);
-                            std::mt19937 gen(reinterpret_cast<uintptr_t>(src0->data));
-                            std::uniform_int_distribution<int> distrib(0, 1);
-                            for(int k = 0; k < K_op; ++k) {
-                                s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
-                            }
-                            src0_buf_ctx->hadamard_s_vectors[src0->data] = s_vec;
-                        } else {
-                            s_vec = it->second;
-                        }
-                    }
+                    std::vector<float> s_vec = get_hadamard_s_vector(src0_buf_ctx, src0, K_op);
 
                     uint8_t* dst_ptr = (uint8_t*)dst_base;
                     #pragma omp parallel for
@@ -499,12 +511,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 || op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
                 ggml_backend_buffer_t src0_buffer = src0->buffer;
                 auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
-                {
-                    std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
-                    auto it = src0_buf_ctx->quantized_tensor_scales.find(src0->data);
-                    GGML_ASSERT(it != src0_buf_ctx->quantized_tensor_scales.end() && "Quantized scale not found");
-                    scale_B = it->second;
-                }
+                scale_B = get_quantized_scale(src0_buf_ctx, src0);
             }
 
             RKNN_CHECK(rknn_mem_sync(matmul_ctx_0->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");

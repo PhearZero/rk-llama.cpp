@@ -1386,6 +1386,11 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
+    if (request.size >= 4) {
+        float val;
+        memcpy(&val, response.data(), 4);
+        LOG_DBG("[%s] first float: %f\n", __func__, val);
+    }
     return true;
 }
 
