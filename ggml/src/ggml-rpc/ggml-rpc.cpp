@@ -110,6 +110,10 @@ enum rpc_cmd {
     RPC_CMD_COUNT,
 };
 
+struct rpc_msg_ack {
+    uint8_t result;
+};
+
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
@@ -512,14 +516,12 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
-    static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+    static std::unordered_map<std::string, std::shared_ptr<socket_t>> sockets;
     static bool initialized = false;
 
     auto it = sockets.find(endpoint);
     if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
-        }
+        return it->second;
     }
     std::string host;
     int port;
@@ -554,7 +556,8 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+    rpc_msg_ack ack;
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), &ack, sizeof(ack));
     RPC_STATUS_ASSERT(status);
     delete ctx;
 }
@@ -627,7 +630,8 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
         request.tensor = serialize_tensor(tensor);
 
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+        rpc_msg_ack ack;
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), &ack, sizeof(ack));
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -655,7 +659,8 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    rpc_msg_ack ack;
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size(), &ack, sizeof(ack));
     RPC_STATUS_ASSERT(status);
 }
 
@@ -694,7 +699,8 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+    rpc_msg_ack ack;
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), &ack, sizeof(ack));
     RPC_STATUS_ASSERT(status);
 }
 
@@ -874,14 +880,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        rpc_msg_ack ack;
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), &ack, sizeof(ack));
         RPC_STATUS_ASSERT(status);
     } else {
         rpc_ctx->gc.add(cgraph);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        rpc_msg_ack ack;
+        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &ack, sizeof(ack));
         RPC_STATUS_ASSERT(status);
     }
     return GGML_STATUS_SUCCESS;
@@ -1701,7 +1709,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.free_buffer(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
                     return;
                 }
                 break;
@@ -1714,7 +1723,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.buffer_clear(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
                     return;
                 }
                 break;
@@ -1725,6 +1735,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.set_tensor(input)) {
+                    return;
+                }
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
                     return;
                 }
                 break;
@@ -1751,7 +1765,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.init_tensor(request)) {
                     return;
                 }
-                if (!send_msg(sockfd, nullptr, 0)) {
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
                     return;
                 }
                 break;
@@ -1792,6 +1807,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!server.graph_compute(input)) {
                     return;
                 }
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_GRAPH_RECOMPUTE: {
@@ -1800,6 +1819,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 if (!server.graph_recompute(request)) {
+                    return;
+                }
+                rpc_msg_ack ack = {1};
+                if (!send_msg(sockfd, &ack, sizeof(ack))) {
                     return;
                 }
                 break;
