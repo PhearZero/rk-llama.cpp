@@ -321,20 +321,23 @@ static float get_quantized_scale(ggml_backend_rknpu_buffer_context* ctx, const s
 }
 
 static std::vector<float> get_hadamard_s_vector(ggml_backend_rknpu_buffer_context* ctx, const struct ggml_tensor* tensor, int K_op) {
+    const struct ggml_tensor* base = tensor;
+    while (base->view_src != nullptr) base = base->view_src;
+
     std::lock_guard<std::mutex> lock(ctx->mutex);
-    auto it = ctx->hadamard_s_vectors.find(tensor);
-    if (it != ctx->hadamard_s_vectors.end()) {
+    auto it = ctx->hadamard_s_vectors.find(base);
+    if (it != ctx->hadamard_s_vectors.end() && (int)it->second.size() >= K_op) {
         return it->second;
     }
 
     // Generating the random sign vector 's'
     std::vector<float> s_vec(K_op);
-    std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor));
+    std::mt19937 gen(reinterpret_cast<uintptr_t>(base));
     std::uniform_int_distribution<int> distrib(0, 1);
     for(int k = 0; k < K_op; ++k) {
         s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
     }
-    ctx->hadamard_s_vectors[tensor] = s_vec;
+    ctx->hadamard_s_vectors[base] = s_vec;
     return s_vec;
 }
 
@@ -756,6 +759,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                     case rknpu2_configuration::NPU_TYPE_INT32: {
                         float dequant_scale = scales_A[m] * scale_B;
+                        if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
+                            dequant_scale /= (float)K_op;
+                        }
+
                         for (size_t i = 0; i < num_active_segments; i++) {
                             int N_offset = active_segments[i].offset_n;
                             int N_segment = active_segments[i].size_n;
@@ -853,14 +860,16 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     const auto* op_support = config.find_op_support(tensor->type);
 
     // If there is a specific packing function defined for this tensor type, it's a weight matrix
-    if (op_support && op_support->pack_func && tensor->view_src == nullptr) {
+    if (op_support && op_support->pack_func) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
 
-        // Mark as packed
+        // Mark as packed (use base tensor for the status)
         {
+            const struct ggml_tensor * base = tensor;
+            while (base->view_src != nullptr) base = base->view_src;
             std::lock_guard<std::mutex> lock(ctx->mutex);
-            ctx->packed_tensors.insert(tensor);
+            ctx->packed_tensors.insert(base);
         }
 
         if (tensor->type == GGML_TYPE_F16) {

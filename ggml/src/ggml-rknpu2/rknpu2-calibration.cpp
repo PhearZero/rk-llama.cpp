@@ -74,14 +74,14 @@ float calculate_min_mse_amax(const float * data, size_t n_elements, int num_step
         #pragma omp parallel for reduction(+:current_mse)
         for (size_t j = 0; j < n_elements; ++j) {
             const float original_val = data[j];
-            
+
             // Quantizing
             const float quantized_f = original_val * iscale;
             const int8_t quantized_i = std::max((int8_t)-7, std::min((int8_t)7, (int8_t)roundf(quantized_f)));
-            
+
             // De-quantizing
             const float dequantized_val = (float)quantized_i * current_scale;
-            
+
             // Accumulating error
             const double diff = (double)original_val - (double)dequantized_val;
             current_mse += diff * diff;
@@ -126,7 +126,7 @@ float calculate_entropy_amax(const float* data, size_t n_elements, int num_bins,
     // Iteratively searching for the best amax by minimizing KL-divergence
     float best_amax = abs_max_val;
     double min_kl_div = std::numeric_limits<double>::max();
-    
+
     // Narrowing the search range to avoid wasting time on obviously bad values
     const float search_min = calculate_percentile_amax(data, n_elements, 99.5f);
     const float search_max = abs_max_val;
@@ -212,21 +212,14 @@ int next_power_of_two(int n) {
 }
 
 void hadamard_transform(float* dst, const float* src, int K, int padded_size) {
-    // If no padding is needed, copy and perform in-place.
-    if (K == padded_size) {
-        memcpy(dst, src, K * sizeof(float));
-        fwht_iterative(dst, K);
-        return;
-    }
-
-    // Using a thread-local buffer to avoid repeated heap allocations.
+    // We always use a thread-local buffer to handle padding and ensure in-place safety.
     thread_local static std::vector<float> padded_data;
-    
+
     // Resizing the buffer only if the current one is too small.
     if (padded_data.size() < (size_t)padded_size) {
         padded_data.resize(padded_size);
     }
-    
+
     // Copying source data and zero-fill the rest (padding).
     memcpy(padded_data.data(), src, K * sizeof(float));
     if (padded_size > K) {
