@@ -1386,11 +1386,6 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     response.resize(request.size, 0);
     ggml_backend_tensor_get(tensor, response.data(), request.offset, request.size);
-    if (request.size >= 4) {
-        float val;
-        memcpy(&val, response.data(), 4);
-        LOG_DBG("[%s] first float: %f\n", __func__, val);
-    }
     return true;
 }
 
@@ -1515,7 +1510,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         return false;
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
-    GGML_LOG_INFO("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
+    LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
 
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
 
@@ -1550,7 +1545,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_LOG_INFO("[%s] graph_compute status: %d\n", __func__, (int)status);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
     stored_graphs[device].graph = graph;
@@ -1568,7 +1562,6 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_LOG_INFO("[%s] graph_recompute status: %d\n", __func__, (int)status);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     return true;
 }

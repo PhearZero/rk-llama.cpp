@@ -430,7 +430,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 3. Preparing A-matrix ==========
         // ===========================================
-        // LOG_DBG("[%s] Node %d Step 3: Preparing A-matrix\n", __func__, i);
         std::vector<float> scales_A(M);
         float scale_B = 1.0f;
         {
@@ -443,10 +442,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // Retrieve activations data to a temporary host buffer
             std::vector<float> x_host(M * K);
             ggml_backend_tensor_get(src1, x_host.data(), 0, M * K * sizeof(float));
-
-            if (x_host.size() >= 1) {
-                GGML_LOG_INFO("[%s] Node %d: src1_data=%p, src1_buffer=%p, first input float: %f\n", __func__, i, src1->data, (void*)src1->buffer, x_host[0]);
-            }
 
             const float* x = x_host.data();
             const int row_stride = K;
@@ -516,7 +511,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 ggml_backend_buffer_t src0_buffer = src0->buffer;
                 auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
                 scale_B = get_quantized_scale(src0_buf_ctx, src0);
-                GGML_LOG_INFO("[%s] Node %d: scales_A[0]=%f, scale_B=%f\n", __func__, i, scales_A[0], scale_B);
             }
 
             RKNN_CHECK(rknn_mem_sync(matmul_ctx_0->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
@@ -647,24 +641,12 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
         return GGML_STATUS_SUCCESS;
     }
 
-    // Use a heuristic to identify the tensor that should be at the base of the buffer.
-    // In RPC, tensors are often initialized in an order that doesn't correspond to their memory addresses.
-    // We assume that the tensor with the lowest data address is the base of the buffer.
-    uintptr_t data_ptr = (uintptr_t)tensor->data;
-    GGML_LOG_INFO("[%s] buffer: %p, data: %p\n", __func__, (void*)buffer, (void*)data_ptr);
-    if (ctx->base_ptr == nullptr || data_ptr < (uintptr_t)ctx->base_ptr) {
-        ctx->base_ptr = tensor->data;
-        // In some cases, the "base" tensor might not be at offset 0 of the buffer.
-        // But for now, we assume it is.
-        ctx->base_ptr_offset = 0;
-    }
-
     return GGML_STATUS_SUCCESS;
 }
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
-    GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, (void*)tensor->data, offset, size);
+    // GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, (void*)tensor->data, offset, size);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("[%s] buffer context is null!\n", __func__);
         return;
@@ -672,19 +654,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
     uintptr_t data_ptr = (uintptr_t)tensor->data;
 
-    // Update base_ptr if we see a lower address during set_tensor too,
-    // because init_tensor might be skipped for some tensors by the RPC client.
-    {
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        if (ctx->base_ptr == nullptr || data_ptr < (uintptr_t)ctx->base_ptr) {
-            GGML_LOG_INFO("[%s] Updating base_ptr from %p to %p\n", __func__, ctx->base_ptr, (void*)data_ptr);
-            ctx->base_ptr = tensor->data;
-            ctx->base_ptr_offset = 0;
-        }
-    }
-
     uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
-    GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
+    // GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
 
     if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
         // Fallback or early exit if pointers are not valid
@@ -759,7 +730,6 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             }
 
             const float global_scale_b = amax / 127.0f;
-            GGML_LOG_INFO("[%s] Storing quantized scale for data=%p: %f (amax=%f)\n", __func__, tensor->data, global_scale_b, amax);
 
             // Storing it in the buffer context cache
             {
@@ -945,19 +915,22 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
 
     if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
+        // Fallback or early exit if pointers are not valid
         if (tensor->data == nullptr && ctx->base_ptr == nullptr && offset == 0 && size <= ctx->dma_buf.size) {
             memcpy(data, dma_base, size);
         }
         return;
     }
-    uint8_t* tensor_dma_ptr = dma_base + (data_ptr - base_ptr);
-    memcpy(data, tensor_dma_ptr + offset, size);
 
-    if (size >= 4) {
-        float val;
-        memcpy(&val, data, 4);
-        // GGML_LOG_INFO("[%s] read first float: %f from offset %zu\n", __func__, val, (size_t)(tensor_dma_ptr + offset - dma_base));
+    size_t tensor_offset_in_buffer = (data_ptr - base_ptr) + ctx->base_ptr_offset;
+    if (tensor_offset_in_buffer + size > ctx->dma_buf.size) {
+        GGML_LOG_ERROR("[%s] tensor_offset_in_buffer (%zu) + size (%zu) > dma_buf.size (%zu)\n",
+                       __func__, tensor_offset_in_buffer, size, ctx->dma_buf.size);
+        return;
     }
+
+    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
+    memcpy(data, tensor_dma_ptr + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -983,9 +956,11 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
         return NULL;
     }
 
-    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context{
-        dma_buf, "rknpu_dma_buffer", {}, {}, {}
-    };
+    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context;
+    ctx->dma_buf = dma_buf;
+    ctx->name = "rknpu_dma_buffer";
+    ctx->base_ptr = dma_buf.virt_addr;
+    ctx->base_ptr_offset = 0;
 
     static const ggml_backend_buffer_i rknpu_buffer_interface = {
         /* .free_buffer   = */ ggml_backend_rknpu_buffer_free_buffer,
