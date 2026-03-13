@@ -997,13 +997,12 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             const int padded_K = rknpu2_calibration::next_power_of_two(K);
             std::vector<float> s_vec = get_hadamard_s_vector(ctx, tensor, padded_K);
 
-            // Applying Hadamard Transform and finding global scale
+            // Applying Hadamard Transform
             std::vector<float> hadamard_data((size_t)padded_K * N, 0.0f);
-            float amax = 0.0f;
             #pragma omp parallel
             {
                 std::vector<float> tmp_row(padded_K, 0.0f);
-                #pragma omp for reduction(max:amax)
+                #pragma omp for
                 for (int n = 0; n < N; ++n) {
                     memcpy(tmp_row.data(), dequantized_data.data() + (size_t)n * K, K * sizeof(float));
                     // Multiply by random sign vector
@@ -1011,10 +1010,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                     // Fast Walsh-Hadamard Transform
                     rknpu2_calibration::hadamard_transform(tmp_row.data(), tmp_row.data(), K, padded_K);
                     memcpy(hadamard_data.data() + (size_t)n * padded_K, tmp_row.data(), padded_K * sizeof(float));
-                    for (int k = 0; k < padded_K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
                 }
             }
 
+            // Finding optimal scale using entropy-based calibration (KL-divergence)
+            const float amax = rknpu2_calibration::calculate_entropy_amax(hadamard_data.data(), (size_t)padded_K * N);
             const float global_scale_b = amax / 7.0f;
 
             // Storing the scale
@@ -1024,10 +1024,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             }
 
             // Quantizing to INT4
-            std::vector<int8_t> quantized_data((size_t)padded_K * N);
+            std::vector<uint8_t> quantized_data((size_t)padded_K * N / 2);
             #pragma omp parallel for
             for (int n = 0; n < N; ++n) {
-                rknpu2_quantization::quantize_fp32_to_int8(hadamard_data.data() + (size_t)n * padded_K, quantized_data.data() + (size_t)n * padded_K, padded_K, global_scale_b);
+                rknpu2_quantization::quantize_fp32_to_int4_packed(hadamard_data.data() + (size_t)n * padded_K, quantized_data.data() + (size_t)n * padded_K / 2, padded_K, global_scale_b);
             }
 
             // Packing into native format
