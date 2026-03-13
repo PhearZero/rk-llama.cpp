@@ -369,12 +369,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int N = src0 ? (int)src0->ne[1] : 0;
 
         if (node->op == GGML_OP_MUL_MAT && (M <= 0 || N <= 0 || K <= 0)) {
-            GGML_LOG_INFO("[%s] Skipping zero-sized MUL_MAT Node %d (M=%d, K=%d, N=%d)\n", __func__, i, M, K, N);
+            // GGML_LOG_INFO("[%s] Skipping zero-sized MUL_MAT Node %d (M=%d, K=%d, N=%d)\n", __func__, i, M, K, N);
             continue;
         }
 
         if (node->op == GGML_OP_MUL_MAT) {
-            GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) M=%d, K=%d, N=%d, type=%d\n", __func__, i, (int)node->op, M, K, N, (int)w_type);
+            // GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) M=%d, K=%d, N=%d, type=%d\n", __func__, i, (int)node->op, M, K, N, (int)w_type);
         }
 
         if (node->op != GGML_OP_MUL_MAT) {
@@ -533,10 +533,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             std::vector<float> x_host(M * K);
             ggml_backend_tensor_get(src1, x_host.data(), 0, M * K * sizeof(float));
 
-            if (M > 0 && K > 0) {
-                GGML_LOG_INFO("[%s] Node %d: src1[0]=%f\n", __func__, i, x_host[0]);
-            }
-
             const float* x = x_host.data();
             const int row_stride = K;
             void* dst_base = mem_A_shared->virt_addr;
@@ -682,10 +678,6 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
             ggml_backend_tensor_set(dst, dst_host.data(), 0, M * N * sizeof(float));
-
-            if (M > 0 && N > 0) {
-                GGML_LOG_INFO("[%s] Node %d: result[0]=%f, scale_A[0]=%f, scale_B=%f\n", __func__, i, dst_host[0], scales_A[0], scale_B);
-            }
         }
     }
 
