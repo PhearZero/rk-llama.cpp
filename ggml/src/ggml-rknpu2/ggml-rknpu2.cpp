@@ -512,6 +512,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 ggml_backend_buffer_t src0_buffer = src0->buffer;
                 auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
                 scale_B = get_quantized_scale(src0_buf_ctx, src0);
+                GGML_LOG_INFO("[%s] Node %d: scales_A[0]=%f, scale_B=%f\n", __func__, i, scales_A[0], scale_B);
             }
 
             RKNN_CHECK(rknn_mem_sync(matmul_ctx_0->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
@@ -754,6 +755,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             }
 
             const float global_scale_b = amax / 127.0f;
+            GGML_LOG_INFO("[%s] Storing quantized scale for data=%p: %f (amax=%f)\n", __func__, tensor->data, global_scale_b, amax);
 
             // Storing it in the buffer context cache
             {
