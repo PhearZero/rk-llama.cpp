@@ -357,9 +357,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             }
 
             size_t type_size_packed;
-            if (w_type == GGML_TYPE_F16) type_size_packed = 2;
-            else if (w_type == GGML_TYPE_Q8_0) type_size_packed = 1;
-            else type_size_packed = 0;
+            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
+            else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
+            else type_size_packed = 0; // INT4
 
             size_t current_offset_in_tensor = 0;
             for (const auto& seg : all_segments) {
@@ -977,7 +977,7 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
 
 static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     UNUSED(buft);
-    return 64;
+    return 4096;
 }
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
