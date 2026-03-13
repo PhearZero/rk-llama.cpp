@@ -300,7 +300,12 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int K = src0 ? (int)src0->ne[0] : 0;
         const int N = src0 ? (int)src0->ne[1] : 0;
 
-        GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d, data=%p, buffer=%p\n", __func__, i, (int)node->op, (int)w_type, M, K, N, (void*)(src0 ? src0->data : nullptr), (void*)(src0 ? src0->buffer : nullptr));
+        if (node->op == GGML_OP_MUL_MAT && (M <= 0 || N <= 0 || K <= 0)) {
+            GGML_LOG_INFO("[%s] Skipping zero-sized MUL_MAT Node %d (M=%d, K=%d, N=%d)\n", __func__, i, M, K, N);
+            continue;
+        }
+
+        // GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d, data=%p, buffer=%p\n", __func__, i, (int)node->op, (int)w_type, M, K, N, (void*)(src0 ? src0->data : nullptr), (void*)(src0 ? src0->buffer : nullptr));
         if (node->op != GGML_OP_MUL_MAT) continue;
 
         const auto* op_support = config.find_op_support(w_type);
@@ -335,19 +340,22 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 1. Preparing contexts ==========
         // ===========================================
-        GGML_LOG_INFO("[%s] Node %d Step 1: Preparing contexts\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 1: Preparing contexts\n", __func__, i);
         {
             for (size_t i = 0; i < num_active_segments; ++i) {
                 const auto& seg = active_segments[i];
                 matmul_ctxs[i] = backend_ctx->get_matmul_ctx(M, K_op, seg.size_n, seg.core_id, matmul_type);
-                if (!matmul_ctxs[i] || matmul_ctxs[i]->ctx == 0) return GGML_STATUS_FAILED;
+                if (!matmul_ctxs[i] || matmul_ctxs[i]->ctx == 0) {
+                    GGML_LOG_ERROR("[%s] Failed to get matmul context for Node %d, core %d (M=%d, K=%d, N=%d)\n", __func__, (int)i, seg.core_id, M, K_op, seg.size_n);
+                    return GGML_STATUS_FAILED;
+                }
             }
         }
 
         // ===========================================
         // ========== 2. Preparing B-matrix ==========
         // ===========================================
-        GGML_LOG_INFO("[%s] Node %d Step 2: Preparing B-matrix\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 2: Preparing B-matrix\n", __func__, i);
         {
             ggml_backend_buffer_t src0_buffer = src0->buffer;
             auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
@@ -393,7 +401,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 3. Preparing A-matrix ==========
         // ===========================================
-        GGML_LOG_INFO("[%s] Node %d Step 3: Preparing A-matrix\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 3: Preparing A-matrix\n", __func__, i);
         std::vector<float> scales_A(M);
         float scale_B = 1.0f;
         {
@@ -509,7 +517,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 4. Preparing C-matrix ==========
         // ===========================================
-        GGML_LOG_INFO("[%s] Node %d Step 4: Preparing C-matrix\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 4: Preparing C-matrix\n", __func__, i);
         {
             for (size_t i = 0; i < num_active_segments; i++) {
                 auto& matmul_ctx = matmul_ctxs[i];
@@ -523,7 +531,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ==========================================
         // ========== 5. Running operation ==========
         // ==========================================
-        GGML_LOG_INFO("[%s] Node %d Step 5: Running operation\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 5: Running operation\n", __func__, i);
         {
             #pragma omp parallel for num_threads(num_active_segments)
             for (size_t i = 0; i < num_active_segments; i++) {
@@ -537,7 +545,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 6. Collecting results ==========
         // ===========================================
-        GGML_LOG_INFO("[%s] Node %d Step 6: Collecting results\n", __func__, i);
+        // LOG_DBG("[%s] Node %d Step 6: Collecting results\n", __func__, i);
         {
             std::vector<float> dst_host(M * N);
             float* dst_data = dst_host.data();
