@@ -133,8 +133,6 @@ struct ggml_backend_rknpu_buffer_context {
     std::unordered_set<const struct ggml_tensor *> packed_tensors;
 
     std::mutex mutex;
-    void * base_ptr = nullptr;
-    size_t base_ptr_offset = 0;
 };
 
 // RKNN matmul operation context
@@ -372,16 +370,6 @@ static void * ggml_rknpu_get_system_ptr(const struct ggml_tensor * tensor) {
     if (is_offset) {
         void* ptr = (uint8_t *)ctx->dma_buf.virt_addr + offset;
         return ptr;
-    }
-
-    // In Protocol v3, if base_ptr is set, check if data_ptr is in the old CPU range
-    if (ctx->base_ptr) {
-        uintptr_t cpu_start = (uintptr_t)ctx->base_ptr;
-        uintptr_t cpu_end = cpu_start + ctx->dma_buf.size;
-        if (data_ptr >= cpu_start && data_ptr < cpu_end) {
-            offset = data_ptr - cpu_start;
-            return (uint8_t *)ctx->dma_buf.virt_addr + offset;
-        }
     }
 
     return (void *)data_ptr;
@@ -885,16 +873,6 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->dma_buf.virt_addr;
 }
 
-static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
-    if (tensor->view_src != nullptr) {
-        tensor->data = (uint8_t *)tensor->view_src->data + tensor->view_offs;
-        return GGML_STATUS_SUCCESS;
-    }
-    tensor->data = (uint8_t *)ctx->dma_buf.virt_addr + ctx->base_ptr_offset;
-    ctx->base_ptr_offset += ggml_nbytes(tensor);
-    return GGML_STATUS_SUCCESS;
-}
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
@@ -1129,6 +1107,16 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     } else {
         memcpy(tensor_dma_ptr + offset, data, size);
     }
+
+    // Explicit cache synchronization to ensure the data is visible to the NPU.
+    // This is crucial for cached DMA buffers where CPU writes are not immediately visible.
+    {
+        rknn_tensor_mem mem = {};
+        mem.virt_addr = ctx->dma_buf.virt_addr;
+        mem.fd = ctx->dma_buf.fd;
+        mem.size = ctx->dma_buf.size;
+        rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    }
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -1137,12 +1125,32 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     if (!tensor_dma_ptr) {
         return;
     }
+
+    // Explicitly synchronize from device if it was previously written by the NPU
+    {
+        auto * buf_ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+        rknn_tensor_mem mem = {};
+        mem.virt_addr = buf_ctx->dma_buf.virt_addr;
+        mem.fd = buf_ctx->dma_buf.fd;
+        mem.size = buf_ctx->dma_buf.size;
+        rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+    }
+
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     memset(ctx->dma_buf.virt_addr, value, ctx->dma_buf.size);
+
+    // Sync TO_DEVICE after clearing
+    {
+        rknn_tensor_mem mem = {};
+        mem.virt_addr = ctx->dma_buf.virt_addr;
+        mem.fd = ctx->dma_buf.fd;
+        mem.size = ctx->dma_buf.size;
+        rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    }
 }
 
 
@@ -1166,13 +1174,11 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
     ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context;
     ctx->dma_buf = dma_buf;
     ctx->name = "rknpu_dma_buffer";
-    ctx->base_ptr = dma_buf.virt_addr;
-    ctx->base_ptr_offset = 0;
 
     static const ggml_backend_buffer_i rknpu_buffer_interface = {
         /* .free_buffer   = */ ggml_backend_rknpu_buffer_free_buffer,
         /* .get_base      = */ ggml_backend_rknpu_buffer_get_base,
-        /* .init_tensor   = */ ggml_backend_rknpu_buffer_init_tensor,
+        /* .init_tensor   = */ NULL,
         /* .memset_tensor = */ NULL,
         /* .set_tensor    = */ ggml_backend_rknpu_buffer_set_tensor,
         /* .get_tensor    = */ ggml_backend_rknpu_buffer_get_tensor,
