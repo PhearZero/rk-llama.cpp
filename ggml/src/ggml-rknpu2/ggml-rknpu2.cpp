@@ -457,7 +457,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
-        const auto* op_support = config.find_op_support(w_type);
+        const auto* op_support = config.find_op_support(w_type, src1 ? src1->type : GGML_TYPE_F32);
         if (node->op == GGML_OP_MUL_MAT) {
             bool supported_by_npu = (op_support != nullptr);
 
@@ -617,9 +617,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
             if (!mem_A_shared) return GGML_STATUS_FAILED;
 
-            // Translate activations pointer
             const void* src1_data = ggml_rknpu_get_system_ptr(src1);
             if (!src1_data) return GGML_STATUS_FAILED;
+
+            // Sync src1 to CPU if it's coming from RKNPU but was modified
+            if (src1->buffer && src1->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
+                auto * src1_buf_ctx = (ggml_backend_rknpu_buffer_context*)src1->buffer->context;
+                // Since RKNPU memory is DMA, we might need a sync from device to ensure CPU sees it
+                // Actually rknpu_get_system_ptr just returns the virtual address.
+                // We should sync BEFORE reading it on CPU if it was written by NPU.
+                rknn_tensor_mem mem = {};
+                mem.virt_addr = src1_buf_ctx->dma_buf.virt_addr;
+                mem.fd = src1_buf_ctx->dma_buf.fd;
+                mem.size = src1_buf_ctx->dma_buf.size;
+                RKNN_CHECK(rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_FROM_DEVICE), "sync src1 FROM_DEVICE");
+            }
 
             const int row_stride = (int)(src1->nb[1] / ggml_element_size(src1));
             void* dst_base = mem_A_shared->virt_addr;
@@ -876,9 +888,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         GGML_LOG_ERROR("[%s] No device configuration found!\n", __func__);
         return;
     }
-    const auto* op_support = config.find_op_support(tensor->type);
-
     // If there is a specific packing function defined for this tensor type, it's a weight matrix
+    // We assume that the packing is the same regardless of activation type (true for currently supported RK3588 ops)
+    const auto* op_support = config.find_op_support(tensor->type, GGML_TYPE_F32);
+    if (!op_support) op_support = config.find_op_support(tensor->type, GGML_TYPE_F16);
+
     if (op_support && op_support->pack_func) {
         const int K = (int)tensor->ne[0];
         const int N = (int)tensor->ne[1];
@@ -1148,7 +1162,8 @@ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // Getting the current device configuration
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* op_support = config.find_op_support(tensor->type);
+    const auto* op_support = config.find_op_support(tensor->type, GGML_TYPE_F32);
+    if (!op_support) op_support = config.find_op_support(tensor->type, GGML_TYPE_F16);
 
     if (op_support && op_support->pack_func) {
         const int K = (int)tensor->ne[0];
@@ -1267,7 +1282,12 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             }
 
             // Checking contiguous memory
-            if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+            // Note: src1 might be a view (KV cache), so we check the rows specifically during execution.
+            // But for RKNPU, we currently require contiguous memory for the whole tensor if we offload it.
+            // Actually, MUL_MAT on RKNPU works on M x K activations.
+            // If it's a view, ggml_is_contiguous(src1) might be false even if it's "mostly" contiguous.
+            // Let's allow non-contiguous src1 and handle it in graph_compute.
+            if (!ggml_is_contiguous(src0)) {
                 return false;
             }
 

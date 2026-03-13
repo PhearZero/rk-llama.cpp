@@ -84,9 +84,9 @@ struct Rknpu2DeviceConfig {
      * @param w_type The ggml_type of the weight tensor.
      * @return A pointer to the Rknpu2Operation if found, otherwise nullptr.
      */
-    const Rknpu2Operation* find_op_support(ggml_type w_type) const {
+    const Rknpu2Operation* find_op_support(ggml_type w_type, ggml_type a_type) const {
         for (const auto& op : supported_ops) {
-            if (op.type_w == w_type) {
+            if (op.type_w == w_type && op.type_a == a_type) {
                 return &op;
             }
         }
