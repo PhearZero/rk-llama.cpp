@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <atomic>
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  ifndef NOMINMAX
@@ -567,16 +568,30 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
     if (ctx->base_ptr != nullptr) {
         return ctx->base_ptr;
     }
-    rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
-    rpc_msg_buffer_get_base_rsp response;
-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
-    RPC_STATUS_ASSERT(status);
-    ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
+    static std::atomic<uintptr_t> dummy_base(0x700000000000ULL);
+    uintptr_t base = dummy_base.fetch_add(0x1000000000ULL); // 64 GB increments
+    ctx->base_ptr = reinterpret_cast<void *>(base);
     return ctx->base_ptr;
 }
 
 static bool ggml_backend_buffer_is_rpc(ggml_backend_buffer_t buffer) {
-    return buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
+    return buffer && buffer->iface.free_buffer == ggml_backend_rpc_buffer_free_buffer;
+}
+
+static void * ggml_get_tensor_buffer_base(const ggml_tensor * tensor) {
+    const ggml_tensor * base = tensor;
+    while (base->view_src) {
+        base = base->view_src;
+    }
+    return ggml_backend_buffer_get_base(base->buffer);
+}
+
+static bool ggml_tensor_is_rpc(const ggml_tensor * tensor) {
+    const ggml_tensor * base = tensor;
+    while (base->view_src) {
+        base = base->view_src;
+    }
+    return ggml_backend_buffer_is_rpc(base->buffer);
 }
 
 static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
@@ -588,8 +603,12 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     result.id = reinterpret_cast<uint64_t>(tensor);
     result.type = tensor->type;
-    if (tensor->buffer && ggml_backend_buffer_is_rpc(tensor->buffer)) {
-        ggml_backend_buffer_t buffer = tensor->buffer;
+    if (ggml_tensor_is_rpc(tensor)) {
+        const ggml_tensor * base = tensor;
+        while (base->view_src) {
+            base = base->view_src;
+        }
+        ggml_backend_buffer_t buffer = base->buffer;
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         result.buffer = ctx != nullptr ? ctx->remote_ptr : 0;
     } else {
@@ -609,7 +628,13 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
     }
     result.view_src = reinterpret_cast<uint64_t>(tensor->view_src);
     result.view_offs = tensor->view_offs;
-    result.data = reinterpret_cast<uint64_t>(tensor->data);
+
+    if (ggml_tensor_is_rpc(tensor)) {
+        void * base = ggml_get_tensor_buffer_base(tensor);
+        result.data = (uint64_t)((char *)tensor->data - (char *)base);
+    } else {
+        result.data = reinterpret_cast<uint64_t>(tensor->data);
+    }
 
     // Avoid sending uninitialized data over the wire
     memset(result.name, 0, sizeof(result.name));
@@ -1190,10 +1215,9 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     if (result->buffer) {
         // require that the tensor data does not go beyond the buffer end
         uint64_t tensor_size = (uint64_t) ggml_nbytes(result);
-        uint64_t buffer_start = (uint64_t) ggml_backend_buffer_get_base(result->buffer);
         uint64_t buffer_size = (uint64_t) ggml_backend_buffer_get_size(result->buffer);
         GGML_ASSERT(tensor->data + tensor_size >= tensor->data); // check for overflow
-        GGML_ASSERT(tensor->data >= buffer_start && tensor->data + tensor_size <= buffer_start + buffer_size);
+        GGML_ASSERT(tensor->data + tensor_size <= buffer_size);
     }
 
     result->op = (ggml_op) tensor->op;
@@ -1201,7 +1225,21 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
         result->op_params[i] = tensor->op_params[i];
     }
     result->flags = tensor->flags;
-    result->data = reinterpret_cast<void *>(tensor->data);
+
+    if (result->buffer) {
+        void * base = ggml_backend_buffer_get_base(result->buffer);
+        result->data = (char *)base + tensor->data;
+    } else if (tensor->buffer != 0) {
+        // RPC tensor from another server - data is an offset
+        result->data = reinterpret_cast<void *>(tensor->data);
+    } else if (tensor->view_src != 0) {
+        // View - view_src will be reconstructed recursively in create_node
+        // But deserialize_tensor is also used directly.
+        // For now, let's set it to the offset.
+        result->data = reinterpret_cast<void *>(tensor->data);
+    } else {
+        result->data = reinterpret_cast<void *>(tensor->data);
+    }
     ggml_set_name(result, tensor->name);
     return result;
 }
@@ -1234,12 +1272,12 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
 
     // sanitize tensor->data
     {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+        const uint64_t total_offset = in_tensor->data + offset;
 
-        if (in_tensor->data + offset < p0 || in_tensor->data + offset >= p1 || size > (p1 - in_tensor->data - offset)) {
-            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu) out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, in_tensor->data, offset, size, p0, p1);
+        if (total_offset + size > buffer_size) {
+            GGML_LOG_ERROR("[%s] tensor data region (offset=%" PRIu64 ", size=%zu) out of buffer bounds (size=%zu)\n",
+                           __func__, total_offset, size, buffer_size);
             return false;
         }
     }
@@ -1305,14 +1343,12 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
 
     // sanitize tensor->data
     {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+        const uint64_t total_offset = request.tensor.data + request.offset;
 
-        if (request.tensor.data + request.offset < p0
-         || request.tensor.data + request.offset >= p1
-         || size > (p1 - request.tensor.data - request.offset)) {
-            GGML_LOG_ERROR("[%s] tensor data region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                           __func__, request.tensor.data, request.offset, size, request.hash, p0, p1);
+        if (total_offset + size > buffer_size) {
+            GGML_LOG_ERROR("[%s] tensor data region (offset=%" PRIu64 ", size=%zu, hash=0x%" PRIx64 ") out of buffer bounds (size=%zu)\n",
+                           __func__, total_offset, size, request.hash, buffer_size);
             return false;
         }
     }
@@ -1372,14 +1408,12 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 
     // sanitize tensor->data
     {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+        const uint64_t total_offset = request.tensor.data + request.offset;
 
-        if (request.tensor.data + request.offset < p0 ||
-            request.tensor.data + request.offset >= p1 ||
-            request.size > (p1 - request.tensor.data - request.offset)) {
-                GGML_LOG_ERROR("[%s] requested tensor region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
-                               __func__, request.tensor.data, request.offset, request.size, p0, p1);
+        if (total_offset + request.size > buffer_size) {
+                GGML_LOG_ERROR("[%s] requested tensor region (offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds (size=%zu)\n",
+                               __func__, total_offset, request.size, buffer_size);
                 return false;
         }
     }
@@ -1407,19 +1441,17 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     }
 
     uint64_t src_size   = (uint64_t) ggml_nbytes(src);
-    uint64_t dst_data   = (uint64_t) dst->data;
-    uint64_t dst_base   = (uint64_t) ggml_backend_buffer_get_base(dst->buffer);
+    uint64_t dst_offset = (uint64_t) request.dst.data;
     uint64_t dst_buf_sz = (uint64_t) ggml_backend_buffer_get_size(dst->buffer);
 
-    if (dst_data + src_size > dst_base + dst_buf_sz) {
+    if (dst_offset + src_size > dst_buf_sz) {
         GGML_LOG_ERROR("[%s] out-of-bounds write in rpc_server::copy_tensor:\n"
                          "    write range : [0x%" PRIx64 ", 0x%" PRIx64 "]\n"
-                         "    buffer base: [0x%" PRIx64 ", 0x%" PRIx64 "]\n",
+                         "    buffer size : %" PRIu64 "\n",
                          __func__,
-                         dst_data,
-                         dst_data + src_size,
-                         dst_base,
-                         dst_base + dst_buf_sz);
+                         dst_offset,
+                         dst_offset + src_size,
+                         dst_buf_sz);
         return false;
     }
 
