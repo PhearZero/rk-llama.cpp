@@ -285,17 +285,17 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor* node = cgraph->nodes[i];
-        if (node->op != GGML_OP_MUL_MAT) continue;
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
-        struct ggml_tensor* dst = node;
 
-        const ggml_type w_type = src0->type;
+        const ggml_type w_type = src0 ? src0->type : GGML_TYPE_COUNT;
+        const int M = src1 ? (int)src1->ne[1] : 0;
+        const int K = src0 ? (int)src0->ne[0] : 0;
+        const int N = src0 ? (int)src0->ne[1] : 0;
 
-        const int M = (int)src1->ne[1];
-        const int K = (int)src0->ne[0];
-        const int N = (int)src0->ne[1];
+        GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d\n", __func__, i, (int)node->op, (int)w_type, M, K, N);
+        if (node->op != GGML_OP_MUL_MAT) continue;
 
         const bool is_q4_hadamard = (src0->type == GGML_TYPE_Q4_0);
         const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
@@ -431,6 +431,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     {
                         std::lock_guard<std::mutex> lock(src0_buf_ctx->mutex);
                         auto it = src0_buf_ctx->hadamard_s_vectors.find(src0->data);
+                        if (it == src0_buf_ctx->hadamard_s_vectors.end()) {
+                            GGML_LOG_ERROR("[%s] Hadamard 's' vector not found for src0->data=%p. Did you forget to set_tensor?\n", __func__, src0->data);
+                        }
                         GGML_ASSERT(it != src0_buf_ctx->hadamard_s_vectors.end() && "Hadamard 's' vector not found");
                         s_vec = it->second;
                     }
