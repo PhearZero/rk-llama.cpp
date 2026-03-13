@@ -38,6 +38,8 @@
 
 #define UNUSED(x) (void)(x)
 
+#define RKNN_MAX_CACHE_SIZE 1024
+
 // Macro for RKNN API calls
 #define RKNN_CHECK(stmt, msg)                                           \
     do {                                                                \
@@ -280,7 +282,6 @@ static void ggml_backend_rknpu_free(ggml_backend_t backend) {
 // Function for getting buffer from cache or creating new one
 static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     ggml_backend_rknpu_context* backend_ctx,
-    rknn_matmul_ctx matmul_ctx,
     size_t size,
     const std::tuple<int, int, int>& key,
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
@@ -291,13 +292,17 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
         return it->second;
     }
 
-    rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
+    if (cache.size() >= RKNN_MAX_CACHE_SIZE) {
+        cache.clear();
+    }
+
+    auto global_ctx = get_rknpu_memory_context().get_ctx();
+    rknn_tensor_mem* mem = rknn_create_mem(global_ctx, size);
     if (!mem) { return nullptr; }
 
-    auto mem_ctx_for_deleter = get_rknpu_memory_context().get_ctx();
-    auto deleter = [mem_ctx_for_deleter](rknn_tensor_mem* m) {
-        if (m && mem_ctx_for_deleter != 0) {
-            rknn_destroy_mem(mem_ctx_for_deleter, m);
+    auto deleter = [global_ctx](rknn_tensor_mem* m) {
+        if (m && global_ctx != 0) {
+            rknn_destroy_mem(global_ctx, m);
         }
     };
 
@@ -580,7 +585,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         if (it != backend_ctx->b_mem_handle_cache.end()) {
                             mem_B_segments[i] = it->second;
                         } else {
-                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
+                            if (backend_ctx->b_mem_handle_cache.size() >= RKNN_MAX_CACHE_SIZE) {
+                                backend_ctx->b_mem_handle_cache.clear();
+                            }
+                            auto global_ctx = get_rknpu_memory_context().get_ctx();
+                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(global_ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
                             if (!mem) {
                                 GGML_LOG_ERROR("[%s] rknn_create_mem_from_fd failed for Node %zu Step 2 (size=%zu, offset=%zu)\n", __func__, i, segment_size_bytes, total_offset);
                                 // Try to clear cache and retry once
@@ -591,10 +600,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                                     backend_ctx->a_buffer_cache.clear();
                                     backend_ctx->c_buffer_cache.clear();
                                 }
-                                mem = rknn_create_mem_from_fd(matmul_ctx->ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
+                                mem = rknn_create_mem_from_fd(global_ctx, src0_buf_ctx->dma_buf.fd, src0_buf_ctx->dma_buf.virt_addr, segment_size_bytes, total_offset);
                                 if (!mem) return GGML_STATUS_FAILED;
                             }
-                            auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
+                            auto deleter = [global_ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(global_ctx, m); };
                             mem_B_segments[i] = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
                             backend_ctx->b_mem_handle_cache[cache_key] = mem_B_segments[i];
                         }
@@ -613,9 +622,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         float scale_B = 1.0f;
         {
             auto cache_key = std::make_tuple(M, K, (int)w_type);
-            auto& matmul_ctx_0 = matmul_ctxs[0];
 
-            mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0->ctx, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+            mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctxs[0]->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
             if (!mem_A_shared) {
                 // Try to clear cache and retry once
                 {
@@ -629,7 +637,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 auto& seg0 = active_segments[0];
                 auto matmul_ctx_0_new = backend_ctx->get_matmul_ctx(M, K_op, seg0.size_n, seg0.core_id, matmul_type);
                 if (!matmul_ctx_0_new) return GGML_STATUS_FAILED;
-                mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0_new->ctx, matmul_ctx_0_new->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+                // Update matmul_ctxs[0] but other matmul_ctxs are still valid because they are held by shared_ptr in the vector
+                mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0_new->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
                 if (!mem_A_shared) return GGML_STATUS_FAILED;
             }
 
@@ -684,7 +693,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 scale_B = get_quantized_scale(src0_buf_ctx, src0);
             }
 
-            RKNN_CHECK(rknn_mem_sync(matmul_ctx_0->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+            RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
 
             for (size_t i = 0; i < num_active_segments; i++) {
                 RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[i]->ctx, mem_A_shared.get(), &matmul_ctxs[i]->io_attr.A), "set_io_mem A for core");
@@ -699,7 +708,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             for (size_t i = 0; i < num_active_segments; i++) {
                 auto& matmul_ctx = matmul_ctxs[i];
                 auto cache_key = std::make_tuple(M, active_segments[i].size_n, active_segments[i].core_id);
-                mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
                 if (!mem_C_segments[i]) {
                     // Try to clear cache and retry once
                     {
@@ -713,7 +722,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     auto& seg = active_segments[i];
                     auto matmul_ctx_new = backend_ctx->get_matmul_ctx(M, K_op, seg.size_n, seg.core_id, matmul_type);
                     if (!matmul_ctx_new) return GGML_STATUS_FAILED;
-                    mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx_new->ctx, matmul_ctx_new->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                    mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx_new->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
                     if (!mem_C_segments[i]) return GGML_STATUS_FAILED;
                 }
                 RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[i].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
