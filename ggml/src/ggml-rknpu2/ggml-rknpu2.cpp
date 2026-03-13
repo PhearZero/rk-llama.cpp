@@ -987,23 +987,26 @@ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* op_support = config.find_op_support(tensor->type);
 
-    // Padding Q4_0 weights to the next power of two for Hadamard Transform.
-    if (tensor->type == GGML_TYPE_Q4_0) {
-        if (op_support && op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-            const int K = (int)tensor->ne[0];
-            const int N = (int)tensor->ne[1];
+    if (op_support && op_support->pack_func) {
+        const int K = (int)tensor->ne[0];
+        const int N = (int)tensor->ne[1];
 
-            const int padded_K = rknpu2_calibration::next_power_of_two(K);
+        const int padded_K = (tensor->type == GGML_TYPE_Q4_0) ? rknpu2_calibration::next_power_of_two(K) : K;
 
-            auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
-            size_t total_size = 0;
-            for (const auto& seg : segments) {
-                if (seg.size_n > 0) {
+        auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
+        size_t total_size = 0;
+        for (const auto& seg : segments) {
+            if (seg.size_n > 0) {
+                if (op_support->mm_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
+                    total_size += (size_t)seg.size_n * padded_K * 2;
+                } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
+                    total_size += (size_t)seg.size_n * padded_K;
+                } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
                     total_size += (size_t)seg.size_n * padded_K / 2;
                 }
             }
-            return total_size;
         }
+        return total_size;
     }
 
     // Fallback to default size calculation for other types.
