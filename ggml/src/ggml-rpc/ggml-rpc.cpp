@@ -770,7 +770,7 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     bool rpc_get = false;
 
     // See comments in init_tensor.
-    rpc_get |= ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr);
+    rpc_get |= ggml_is_quantized(tensor->type) && (tensor->view_src == nullptr);
 
     // ops that require additional memory for fleeting data on certain backends
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966

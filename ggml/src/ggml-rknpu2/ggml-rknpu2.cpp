@@ -121,9 +121,6 @@ struct ggml_backend_rknpu_buffer_context {
     // Per-tensor scale for weights
     std::unordered_map<void *, float> quantized_tensor_scales;
 
-    // Per-tensor random sign vector for Hadamard Transform
-    std::unordered_map<void *, std::vector<float>> hadamard_s_vectors;
-
     std::mutex mutex;
     void * base_ptr = nullptr;
     size_t base_ptr_offset = 0;
@@ -304,22 +301,10 @@ static float get_quantized_scale(ggml_backend_rknpu_buffer_context* ctx, const s
 }
 
 static std::vector<float> get_hadamard_s_vector(ggml_backend_rknpu_buffer_context* ctx, const struct ggml_tensor* tensor, int K_op) {
-    const struct ggml_tensor* base = tensor;
-    while (base->view_src != nullptr) base = base->view_src;
-
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    auto it = ctx->hadamard_s_vectors.find(base->data);
-    if (it != ctx->hadamard_s_vectors.end()) return it->second;
-
-    // Regenerate if missing
-    std::vector<float> s_vec(K_op);
-    std::mt19937 gen(reinterpret_cast<uintptr_t>(base->data));
-    std::uniform_int_distribution<int> distrib(0, 1);
-    for(int k = 0; k < K_op; ++k) {
-        s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
-    }
-    ctx->hadamard_s_vectors[base->data] = s_vec;
-    return s_vec;
+    UNUSED(ctx);
+    UNUSED(tensor);
+    UNUSED(K_op);
+    return {};
 }
 
 static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer);
@@ -448,8 +433,8 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
-        const bool is_q4_hadamard = (w_type == GGML_TYPE_Q4_0);
-        const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
+        const bool is_q4_hadamard = false;
+        const int K_op = K;
 
         const rknn_matmul_type matmul_type = op_support->mm_type;
         const int alignment = op_support->n_align;
@@ -585,30 +570,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
 
                 case rknpu2_configuration::NPU_TYPE_INT4: {
-                    if (src0->buffer == nullptr) {
-                        GGML_LOG_ERROR("[%s] src0->buffer is null for MUL_MAT Node %d\n", __func__, i);
-                        return GGML_STATUS_FAILED;
-                    }
-                    auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0->buffer->context;
-                    std::vector<float> s_vec = get_hadamard_s_vector(src0_buf_ctx, src0, K_op);
-
-                    uint8_t* dst_ptr = (uint8_t*)dst_base;
-                    #pragma omp parallel for
-                    for (int m = 0; m < M; ++m) {
-                        const float* src_row = x + (size_t)m * row_stride;
-                        std::vector<float> signed_row(K);
-                        for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
-
-                        std::vector<float> rotated_row(K_op);
-                        rknpu2_calibration::hadamard_transform(rotated_row.data(), signed_row.data(), K, K_op);
-
-                        float amax_m = 0.0f;
-                        for (int k = 0; k < K_op; ++k) amax_m = std::max(amax_m, std::abs(rotated_row[k]));
-                        scales_A[m] = amax_m / 7.0f;
-                        uint8_t* dst_row = dst_ptr + (size_t)m * (K_op / 2);
-                        rknpu2_quantization::quantize_fp32_to_int4_packed(rotated_row.data(), dst_row, K_op, scales_A[m]);
-                    }
-                    break;
+                    return GGML_STATUS_FAILED;
                 }
 
                 default:
@@ -824,7 +786,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size_bytes);
                 current_write_ptr += segment_packed_size_bytes;
             }
-        // Quantized types mapping to INT8
+        // Other quantized types mapping to INT8
         } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8 && ggml_is_quantized(tensor->type)) {
             const size_t n_elements = (size_t)K * N;
             auto traits = ggml_get_type_traits(tensor->type);
@@ -879,140 +841,6 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 );
                 memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
                 current_write_ptr += segment_packed_size;
-            }
-        // GGML_TYPE_Q4_0
-        } else if (tensor->type == GGML_TYPE_Q4_0) {
-            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                const block_q4_0* src_blocks = (const block_q4_0*)data;
-
-                // Dequantizing original weights to FP32
-                const size_t n_elements_original = (size_t)K * N;
-                std::vector<float> dequantized_data(n_elements_original);
-                #pragma omp parallel for
-                for (int n = 0; n < N; ++n) {
-                    dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), dequantized_data.data() + (size_t)n * K, K);
-                }
-
-                // Padding K and generating the random sign vector 's'
-                const int padded_K = rknpu2_calibration::next_power_of_two(K);
-                std::vector<float> s_vec(padded_K);
-                std::mt19937 gen(reinterpret_cast<uintptr_t>(tensor->data));
-                std::uniform_int_distribution<int> distrib(0, 1);
-                for(int k = 0; k < padded_K; ++k) {
-                    s_vec[k] = (distrib(gen) == 0) ? -1.0f : 1.0f;
-                }
-
-                // Storing the vector for use during activation processing
-                {
-                    std::lock_guard<std::mutex> lock(ctx->mutex);
-                    GGML_LOG_INFO("[%s] Storing Hadamard 's' vector for data=%p, K=%d, padded_K=%d\n", __func__, tensor->data, K, padded_K);
-                    ctx->hadamard_s_vectors[tensor->data] = s_vec;
-                }
-
-                // Rotating the FP32 weight matrix using padding
-                const size_t n_elements_padded = (size_t)N * padded_K;
-                std::vector<float> rotated_b_fp32(n_elements_padded);
-                #pragma omp parallel for
-                for (int n = 0; n < N; ++n) {
-                    const float* src_row = dequantized_data.data() + (size_t)n * K;
-                    float* dst_row_rot = rotated_b_fp32.data() + (size_t)n * padded_K;
-
-                    std::vector<float> signed_row(K);
-                    for(int k=0; k<K; ++k) signed_row[k] = src_row[k] * s_vec[k];
-
-                    rknpu2_calibration::hadamard_transform(dst_row_rot, signed_row.data(), K, padded_K);
-                }
-
-                // Finding scale on the rotated data
-                const float amax = rknpu2_calibration::calculate_entropy_amax(rotated_b_fp32.data(), n_elements_padded);
-                const float global_scale_b = amax / 7.0f;
-
-                {
-                    std::lock_guard<std::mutex> lock(ctx->mutex);
-                    ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
-                }
-
-                // Quantizing data to INT4
-                std::vector<uint8_t> packed_int4_data(n_elements_padded / 2);
-                #pragma omp parallel for
-                for (int n = 0; n < N; ++n) {
-                    rknpu2_quantization::quantize_fp32_to_int4_packed(
-                        rotated_b_fp32.data() + (size_t)n * padded_K,
-                        packed_int4_data.data() + (size_t)n * (padded_K/2),
-                        padded_K, global_scale_b
-                    );
-                }
-
-                // Packing into native RKNN format with padded_K
-                uint8_t* current_write_ptr = tensor_dma_ptr;
-                std::vector<uint8_t> packed_data_temp;
-
-                for (const auto& seg : compute_matrix_segments(N, config.core_count, op_support->n_align)) {
-                    if (seg.size_n == 0) continue;
-                    size_t segment_packed_size = (size_t)seg.size_n * padded_K / 2;
-                    packed_data_temp.resize(segment_packed_size);
-
-                    op_support->pack_func(
-                        packed_data_temp.data(),
-                        packed_int4_data.data(),
-                        padded_K, N, seg.offset_n, seg.size_n
-                    );
-                    memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
-                    current_write_ptr += segment_packed_size;
-                }
-            } else {
-                const block_q4_0* src_blocks = (const block_q4_0*)data;
-                const size_t n_elements = (size_t)K * N;
-
-                // Finding the global scale without storing the full dequantized matrix.
-                float amax = 0.0f;
-                #pragma omp parallel
-                {
-                    std::vector<float> tmp_row(K);
-                    #pragma omp for reduction(max:amax)
-                    for (int n = 0; n < N; ++n) {
-                        dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), tmp_row.data(), K);
-                        for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
-                    }
-                }
-
-                const float global_scale_b = amax / 7.0f;
-
-                // Storing it in the buffer context cache
-                {
-                    std::lock_guard<std::mutex> lock(ctx->mutex);
-                    ctx->quantized_tensor_scales[tensor->data] = global_scale_b;
-                }
-
-                // Dequantizing and re-quantizing directly row-by-row
-                std::vector<uint8_t> requantized_data(n_elements / 2);
-                #pragma omp parallel
-                {
-                    std::vector<float> tmp_row(K);
-                    #pragma omp for
-                    for (int n = 0; n < N; ++n) {
-                        dequantize_row_q4_0(src_blocks + (size_t)n * (K / QK4_0), tmp_row.data(), K);
-                        rknpu2_quantization::quantize_fp32_to_int4_packed(tmp_row.data(), requantized_data.data() + (size_t)n * (K/2), K, global_scale_b);
-                    }
-                }
-
-                // Packing into native format by segments
-                auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
-                uint8_t* current_write_ptr = tensor_dma_ptr;
-                std::vector<uint8_t> packed_data_temp;
-
-                for (const auto& seg : segments) {
-                    if (seg.size_n == 0) continue;
-                    size_t segment_packed_size = (size_t)seg.size_n * K / 2;
-                    packed_data_temp.resize(segment_packed_size);
-
-                    op_support->pack_func(
-                        packed_data_temp.data(), requantized_data.data(),
-                        K, N, seg.offset_n, seg.size_n
-                    );
-                    memcpy(current_write_ptr, packed_data_temp.data(), segment_packed_size);
-                    current_write_ptr += segment_packed_size;
-                }
             }
         }
     // Other tensor types

@@ -197,14 +197,14 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .pack_func = */ pack_B_rk3588_int8
         },
         {
-            /* .type_w    = */ GGML_TYPE_Q4_0,              // Weights must be converted from Q4_0
+            /* .type_w    = */ GGML_TYPE_Q4_0,
             /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_INT4,              // Activations must be converted to INT4
-            /* .npu_type_c = */ NPU_TYPE_INT16,             // Result must be converted from INT16
-            /* .mm_type   = */ RKNN_INT4_MM_INT4_TO_INT16,
+            /* .npu_type_a = */ NPU_TYPE_INT8,
+            /* .npu_type_c = */ NPU_TYPE_INT32,
+            /* .mm_type   = */ RKNN_INT8_MM_INT8_TO_INT32,
             /* .k_align   = */ 32,
-            /* .n_align   = */ 64,
-            /* .pack_func = */ pack_B_rk3588_int4
+            /* .n_align   = */ 32,
+            /* .pack_func = */ pack_B_rk3588_int8
         }
     };
     device_configs["RK3588"] = rk3588_config;
