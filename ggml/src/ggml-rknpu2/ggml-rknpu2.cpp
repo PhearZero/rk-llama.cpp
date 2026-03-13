@@ -391,9 +391,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (node->op != GGML_OP_MUL_MAT) {
             if (backend_ctx->cpu_fallback) {
                 GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
+                struct ggml_tensor * tmp_nodes[1] = { node };
                 struct ggml_cgraph temp_graph = {};
                 temp_graph.n_nodes = 1;
-                temp_graph.nodes[0] = node;
+                temp_graph.nodes = tmp_nodes;
 
                 std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
                 translate_tensor_recursive(node, saved_ptrs);
@@ -408,6 +409,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
                     return status;
                 }
+                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             }
             continue;
         }
@@ -416,9 +418,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         if (op_support == nullptr) {
             if (backend_ctx->cpu_fallback) {
                 GGML_LOG_INFO("[%s] Node %d: op=%d (%s) with type %d not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op), (int)w_type);
+                struct ggml_tensor * tmp_nodes[1] = { node };
                 struct ggml_cgraph temp_graph = {};
                 temp_graph.n_nodes = 1;
-                temp_graph.nodes[0] = node;
+                temp_graph.nodes = tmp_nodes;
 
                 std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
                 translate_tensor_recursive(node, saved_ptrs);
@@ -433,6 +436,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
                     return status;
                 }
+                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             } else {
                 GGML_LOG_ERROR("[%s] op_support is null for type %d and no CPU fallback available\n", __func__, (int)w_type);
                 return GGML_STATUS_FAILED;
