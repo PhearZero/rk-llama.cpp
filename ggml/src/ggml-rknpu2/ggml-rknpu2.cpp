@@ -444,6 +444,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             std::vector<float> x_host(M * K);
             ggml_backend_tensor_get(src1, x_host.data(), 0, M * K * sizeof(float));
 
+            if (x_host.size() >= 1) {
+                GGML_LOG_INFO("[%s] Node %d: first input float: %f\n", __func__, i, x_host[0]);
+            }
+
             const float* x = x_host.data();
             const int row_stride = K;
             void* dst_base = mem_A_shared->virt_addr;
@@ -948,6 +952,12 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     }
     uint8_t* tensor_dma_ptr = dma_base + (data_ptr - base_ptr);
     memcpy(data, tensor_dma_ptr + offset, size);
+
+    if (size >= 4) {
+        float val;
+        memcpy(&val, data, 4);
+        // GGML_LOG_INFO("[%s] read first float: %f from offset %zu\n", __func__, val, (size_t)(tensor_dma_ptr + offset - dma_base));
+    }
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
