@@ -599,6 +599,7 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
     // In RPC, tensors are often initialized in an order that doesn't correspond to their memory addresses.
     // We assume that the tensor with the lowest data address is the base of the buffer.
     uintptr_t data_ptr = (uintptr_t)tensor->data;
+    GGML_LOG_INFO("[%s] buffer: %p, data: %p\n", __func__, (void*)buffer, (void*)data_ptr);
     if (ctx->base_ptr == nullptr || data_ptr < (uintptr_t)ctx->base_ptr) {
         ctx->base_ptr = tensor->data;
         // In some cases, the "base" tensor might not be at offset 0 of the buffer.
@@ -611,15 +612,27 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
-    // GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, data, offset, size);
+    GGML_LOG_INFO("[%s] buffer: %p, context: %p, tensor: %p, data: %p, offset: %zu, size: %zu\n", __func__, (void*)buffer, (void*)ctx, (void*)tensor, (void*)tensor->data, offset, size);
     if (ctx == nullptr) {
         GGML_LOG_ERROR("[%s] buffer context is null!\n", __func__);
         return;
     }
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
     uintptr_t data_ptr = (uintptr_t)tensor->data;
+
+    // Update base_ptr if we see a lower address during set_tensor too,
+    // because init_tensor might be skipped for some tensors by the RPC client.
+    {
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        if (ctx->base_ptr == nullptr || data_ptr < (uintptr_t)ctx->base_ptr) {
+            GGML_LOG_INFO("[%s] Updating base_ptr from %p to %p\n", __func__, ctx->base_ptr, (void*)data_ptr);
+            ctx->base_ptr = tensor->data;
+            ctx->base_ptr_offset = 0;
+        }
+    }
+
     uintptr_t base_ptr = (uintptr_t)ctx->base_ptr;
-    // GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
+    GGML_LOG_INFO("[%s] dma_base: %p, data_ptr: %p, base_ptr: %p\n", __func__, (void*)dma_base, (void*)data_ptr, (void*)base_ptr);
 
     if (tensor->data == nullptr || ctx->base_ptr == nullptr) {
         // Fallback or early exit if pointers are not valid
@@ -640,7 +653,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     }
 
     uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
-    // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p\n", __func__, (void*)tensor_dma_ptr);
+    GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
 
     // Getting the current device configuration to drive the packing logic
     auto& config_manager = rknpu2_configuration::Rknpu2ConfigManager::get_instance();
