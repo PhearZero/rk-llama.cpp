@@ -388,6 +388,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
+        if (node->op == GGML_OP_MUL_MAT) {
+            GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) M=%d, K=%d, N=%d, type=%d\n", __func__, i, (int)node->op, M, K, N, (int)w_type);
+        }
+
         if (node->op != GGML_OP_MUL_MAT) {
             if (backend_ctx->cpu_fallback) {
                 GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
@@ -543,6 +547,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // Retrieve activations data to a temporary host buffer
             std::vector<float> x_host(M * K);
             ggml_backend_tensor_get(src1, x_host.data(), 0, M * K * sizeof(float));
+
+            if (M > 0 && K > 0) {
+                GGML_LOG_INFO("[%s] Node %d: src1[0]=%f\n", __func__, i, x_host[0]);
+            }
 
             const float* x = x_host.data();
             const int row_stride = K;
@@ -712,6 +720,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 }
             }
             ggml_backend_tensor_set(dst, dst_host.data(), 0, M * N * sizeof(float));
+
+            if (M > 0 && N > 0) {
+                GGML_LOG_INFO("[%s] Node %d: result[0]=%f, scale_A[0]=%f, scale_B=%f\n", __func__, i, dst_host[0], scales_A[0], scale_B);
+            }
         }
     }
 
@@ -777,7 +789,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     }
 
     uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
-    GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
+    // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
 
     // Getting the current device configuration to drive the packing logic
     auto& config_manager = rknpu2_configuration::Rknpu2ConfigManager::get_instance();
@@ -1031,6 +1043,7 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     }
 
     uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
+    // GGML_LOG_INFO("[%s] tensor_dma_ptr: %p, size: %zu, dma_buf.size: %zu\n", __func__, (void*)tensor_dma_ptr, size, ctx->dma_buf.size);
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
