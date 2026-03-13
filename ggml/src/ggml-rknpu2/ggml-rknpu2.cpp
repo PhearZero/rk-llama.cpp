@@ -363,30 +363,25 @@ static void * ggml_rknpu_get_system_ptr(const struct ggml_tensor * tensor) {
         return (void *)data_ptr;
     }
 
-    // In Protocol v3, tensor->data is a relative offset if it's an RPC tensor.
-    // If it's NOT a pointer in the DMA range, we treat it as a relative offset.
+    // Heuristic: absolute pointers are usually much larger than relative offsets
+    // On 64-bit systems, virtual addresses are typically > 0x100000000 (4GB)
+    // Small values (< buffer_size) are likely offsets from the buffer base.
     size_t offset = (size_t)data_ptr;
-
-    // Use a heuristic to distinguish between relative offsets and absolute pointers.
-    // Small values are likely offsets. Large values are likely pointers.
-    // If it's larger than the buffer size, it's definitely not a valid offset for THIS buffer.
     bool is_offset = (offset < ctx->dma_buf.size);
 
-    // Additional check: if base_ptr is set, we can check if data_ptr is in the old CPU range
-    if (!is_offset && ctx->base_ptr) {
+    if (is_offset) {
+        void* ptr = (uint8_t *)ctx->dma_buf.virt_addr + offset;
+        return ptr;
+    }
+
+    // In Protocol v3, if base_ptr is set, check if data_ptr is in the old CPU range
+    if (ctx->base_ptr) {
         uintptr_t cpu_start = (uintptr_t)ctx->base_ptr;
         uintptr_t cpu_end = cpu_start + ctx->dma_buf.size;
         if (data_ptr >= cpu_start && data_ptr < cpu_end) {
             offset = data_ptr - cpu_start;
-            is_offset = true;
+            return (uint8_t *)ctx->dma_buf.virt_addr + offset;
         }
-    }
-
-    if (is_offset) {
-        void* ptr = (uint8_t *)ctx->dma_buf.virt_addr + offset;
-        GGML_LOG_DEBUG("[%s] Translated %p to %p (offset %zu) in buffer %s\n",
-                       __func__, (void*)data_ptr, ptr, offset, ctx->name.c_str());
-        return ptr;
     }
 
     return (void *)data_ptr;
@@ -622,8 +617,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
             if (!mem_A_shared) return GGML_STATUS_FAILED;
 
-            const float* x = (const float*)src1->data;
-            const int row_stride = (int)(src1->nb[1] / sizeof(float));
+            // Translate activations pointer
+            const void* src1_data = ggml_rknpu_get_system_ptr(src1);
+            if (!src1_data) return GGML_STATUS_FAILED;
+
+            const int row_stride = (int)(src1->nb[1] / ggml_element_size(src1));
             void* dst_base = mem_A_shared->virt_addr;
 
             switch (op_support->npu_type_a) {
@@ -631,9 +629,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     uint16_t* dst_ptr = (uint16_t*)dst_base;
                     #pragma omp parallel for
                     for (int m = 0; m < M; ++m) {
-                        const float* src_row = x + (size_t)m * row_stride;
-                        uint16_t* dst_row = dst_ptr + (size_t)m * K;
-                        rknpu2_quantization::convert_fp32_to_fp16(src_row, dst_row, K);
+                        if (src1->type == GGML_TYPE_F32) {
+                            const float* src_row = (const float*)src1_data + (size_t)m * row_stride;
+                            uint16_t* dst_row = dst_ptr + (size_t)m * K;
+                            rknpu2_quantization::convert_fp32_to_fp16(src_row, dst_row, K);
+                        } else if (src1->type == GGML_TYPE_F16) {
+                            const uint16_t* src_row = (const uint16_t*)src1_data + (size_t)m * row_stride;
+                            uint16_t* dst_row = dst_ptr + (size_t)m * K;
+                            memcpy(dst_row, src_row, K * sizeof(uint16_t));
+                        }
                     }
                     break;
                 }
@@ -642,14 +646,22 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     int8_t* dst_ptr = (int8_t*)dst_base;
                     #pragma omp parallel for
                     for (int m = 0; m < M; ++m) {
-                        const float* src_row = x + (size_t)m * row_stride;
                         float amax_m = 0.0f;
-                        for (int k = 0; k < K; ++k) {
-                            amax_m = std::max(amax_m, std::abs(src_row[k]));
-                        }
-                        scales_A[m] = amax_m / 127.0f;
                         int8_t* dst_row = dst_ptr + (size_t)m * K;
-                        rknpu2_quantization::quantize_fp32_to_int8(src_row, dst_row, K, scales_A[m]);
+
+                        if (src1->type == GGML_TYPE_F32) {
+                            const float* src_row = (const float*)src1_data + (size_t)m * row_stride;
+                            for (int k = 0; k < K; ++k) amax_m = std::max(amax_m, std::abs(src_row[k]));
+                            scales_A[m] = amax_m / 127.0f;
+                            rknpu2_quantization::quantize_fp32_to_int8(src_row, dst_row, K, scales_A[m]);
+                        } else if (src1->type == GGML_TYPE_F16) {
+                            const uint16_t* src_row = (const uint16_t*)src1_data + (size_t)m * row_stride;
+                            std::vector<float> tmp_row(K);
+                            rknpu2_quantization::convert_fp16_to_fp32(src_row, tmp_row.data(), K);
+                            for (int k = 0; k < K; ++k) amax_m = std::max(amax_m, std::abs(tmp_row[k]));
+                            scales_A[m] = amax_m / 127.0f;
+                            rknpu2_quantization::quantize_fp32_to_int8(tmp_row.data(), dst_row, K, scales_A[m]);
+                        }
                     }
                     break;
                 }
@@ -665,9 +677,16 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                         std::vector<float> tmp_row(K_op, 0.0f);
                         #pragma omp for
                         for (int m = 0; m < M; ++m) {
-                            const float* src_row = x + (size_t)m * row_stride;
-                            memset(tmp_row.data(), 0, K_op * sizeof(float));
-                            memcpy(tmp_row.data(), src_row, K * sizeof(float));
+                            if (src1->type == GGML_TYPE_F32) {
+                                const float* src_row = (const float*)src1_data + (size_t)m * row_stride;
+                                memset(tmp_row.data(), 0, K_op * sizeof(float));
+                                memcpy(tmp_row.data(), src_row, K * sizeof(float));
+                            } else if (src1->type == GGML_TYPE_F16) {
+                                const uint16_t* src_row = (const uint16_t*)src1_data + (size_t)m * row_stride;
+                                memset(tmp_row.data(), 0, K_op * sizeof(float));
+                                rknpu2_quantization::convert_fp16_to_fp32(src_row, tmp_row.data(), K);
+                            }
+                            
                             // Multiply by random sign vector
                             for (int k = 0; k < K_op; ++k) tmp_row[k] *= s_vec[k];
                             // Fast Walsh-Hadamard Transform
