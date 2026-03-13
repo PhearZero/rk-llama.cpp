@@ -288,6 +288,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
+        struct ggml_tensor* dst = node;
 
         const ggml_type w_type = src0 ? src0->type : GGML_TYPE_COUNT;
         const int M = src1 ? (int)src1->ne[1] : 0;
