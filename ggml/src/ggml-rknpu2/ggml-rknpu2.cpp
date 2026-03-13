@@ -433,7 +433,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         if (node->op != GGML_OP_MUL_MAT) {
             if (backend_ctx->cpu_fallback) {
-                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
+                // GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
                 struct ggml_tensor * tmp_nodes[1] = { node };
                 struct ggml_cgraph temp_graph = {};
                 temp_graph.n_nodes = 1;
@@ -452,7 +452,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
                     return status;
                 }
-                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
+                // GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             }
             continue;
         }
@@ -956,10 +956,15 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
             #pragma omp parallel
             {
                 std::vector<float> tmp_row(K);
-                #pragma omp for reduction(max:amax)
+                float amax_local = 0.0f;
+                #pragma omp for
                 for (int n = 0; n < N; ++n) {
                     dequantize_row_q8_0(src_blocks + (size_t)n * (K / QK8_0), tmp_row.data(), K);
-                    for (int k = 0; k < K; ++k) amax = std::max(amax, std::abs(tmp_row[k]));
+                    for (int k = 0; k < K; ++k) amax_local = std::max(amax_local, std::abs(tmp_row[k]));
+                }
+                #pragma omp critical
+                {
+                    amax = std::max(amax, amax_local);
                 }
             }
 
@@ -1024,6 +1029,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
                 std::vector<float> tmp_row(padded_K, 0.0f);
                 #pragma omp for
                 for (int n = 0; n < N; ++n) {
+                    memset(tmp_row.data(), 0, padded_K * sizeof(float));
                     memcpy(tmp_row.data(), dequantized_data.data() + (size_t)n * K, K * sizeof(float));
                     // Multiply by random sign vector
                     for (int k = 0; k < padded_K; ++k) tmp_row[k] *= s_vec[k];
@@ -1232,24 +1238,26 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
-            // Finding if there is a supported operation for the given weight type
-            const auto* op_support = config.find_op_support(src0->type);
-            if (!op_support) {
-                return false;
+            // Finding if there is a supported operation for the given weight type and activation type
+            bool found_op = false;
+            for (const auto& rk_op : config.supported_ops) {
+                if (rk_op.type_w == src0->type && rk_op.type_a == src1->type) {
+                    // Checking for K alignment
+                    if (src0->ne[0] % rk_op.k_align != 0) {
+                        continue;
+                    }
+
+                    // Checking for N alignment
+                    if (src0->ne[1] % rk_op.n_align != 0) {
+                        continue;
+                    }
+
+                    found_op = true;
+                    break;
+                }
             }
 
-            // Checking if activation type matches the supported operation
-            if (src1->type != op_support->type_a) {
-                return false;
-            }
-
-            // Checking for K alignment
-            if (src0->ne[0] % op_support->k_align != 0) {
-                return false;
-            }
-
-            // Checking for N alignment
-            if (src0->ne[1] % op_support->n_align != 0) {
+            if (!found_op) {
                 return false;
             }
 
