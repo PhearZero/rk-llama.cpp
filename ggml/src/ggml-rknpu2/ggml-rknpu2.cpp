@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include "ggml-cpu.h"
 
 #include "rknpu2-allocation.h"
 #include "rknpu2-quantization.h"
@@ -166,6 +167,18 @@ struct ggml_backend_rknpu_context {
     // A- and C-matrices cache (from create_mem)
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> a_buffer_cache;
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
+
+    ggml_backend_t cpu_fallback = nullptr;
+
+    ggml_backend_rknpu_context() {
+        cpu_fallback = ggml_backend_cpu_init();
+    }
+
+    ~ggml_backend_rknpu_context() {
+        if (cpu_fallback) {
+            ggml_backend_free(cpu_fallback);
+        }
+    }
 
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -334,13 +347,38 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             continue;
         }
 
-        // GGML_LOG_INFO("[%s] Node %d: op=%d, type=%d, M=%d, K=%d, N=%d, data=%p, buffer=%p\n", __func__, i, (int)node->op, (int)w_type, M, K, N, (void*)(src0 ? src0->data : nullptr), (void*)(src0 ? src0->buffer : nullptr));
-        if (node->op != GGML_OP_MUL_MAT) continue;
+        if (node->op != GGML_OP_MUL_MAT) {
+            if (backend_ctx->cpu_fallback) {
+                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
+                struct ggml_cgraph temp_graph = {};
+                temp_graph.n_nodes = 1;
+                temp_graph.nodes[0] = node;
+                ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
+                    return status;
+                }
+            }
+            continue;
+        }
 
         const auto* op_support = config.find_op_support(w_type);
         if (op_support == nullptr) {
-            GGML_LOG_ERROR("[%s] op_support is null for type %d\n", __func__, (int)w_type);
-            return GGML_STATUS_FAILED;
+            if (backend_ctx->cpu_fallback) {
+                GGML_LOG_INFO("[%s] Node %d: op=%d (%s) with type %d not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op), (int)w_type);
+                struct ggml_cgraph temp_graph = {};
+                temp_graph.n_nodes = 1;
+                temp_graph.nodes[0] = node;
+                ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
+                    return status;
+                }
+            } else {
+                GGML_LOG_ERROR("[%s] op_support is null for type %d and no CPU fallback available\n", __func__, (int)w_type);
+                return GGML_STATUS_FAILED;
+            }
+            continue;
         }
 
         const bool is_q4_hadamard = (w_type == GGML_TYPE_Q4_0);
