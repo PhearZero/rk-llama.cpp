@@ -445,7 +445,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             ggml_backend_tensor_get(src1, x_host.data(), 0, M * K * sizeof(float));
 
             if (x_host.size() >= 1) {
-                GGML_LOG_INFO("[%s] Node %d: first input float: %f\n", __func__, i, x_host[0]);
+                GGML_LOG_INFO("[%s] Node %d: src1_data=%p, src1_buffer=%p, first input float: %f\n", __func__, i, src1->data, (void*)src1->buffer, x_host[0]);
             }
 
             const float* x = x_host.data();
