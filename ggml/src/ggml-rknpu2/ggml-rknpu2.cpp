@@ -342,37 +342,8 @@ static std::vector<float> get_hadamard_s_vector(ggml_backend_rknpu_buffer_contex
 static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer);
 
 static void * ggml_rknpu_get_system_ptr(const struct ggml_tensor * tensor) {
-    if (!tensor || !tensor->data) return nullptr;
-
-    ggml_backend_buffer_t buffer = tensor->buffer;
-    if (!buffer) return tensor->data;
-
-    if (buffer->iface.get_base != ggml_backend_rknpu_buffer_get_base) {
-        return tensor->data;
-    }
-
-    auto * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
-    uintptr_t data_ptr = (uintptr_t)tensor->data;
-
-    // Check if data_ptr is already within the DMA buffer's virtual address range
-    uintptr_t dma_start = (uintptr_t)ctx->dma_buf.virt_addr;
-    uintptr_t dma_end = dma_start + ctx->dma_buf.size;
-    if (data_ptr >= dma_start && data_ptr < dma_end) {
-        return (void *)data_ptr;
-    }
-
-    // Heuristic: absolute pointers are usually much larger than relative offsets
-    // On 64-bit systems, virtual addresses are typically > 0x100000000 (4GB)
-    // Small values (< buffer_size) are likely offsets from the buffer base.
-    size_t offset = (size_t)data_ptr;
-    bool is_offset = (offset < ctx->dma_buf.size);
-
-    if (is_offset) {
-        void* ptr = (uint8_t *)ctx->dma_buf.virt_addr + offset;
-        return ptr;
-    }
-
-    return (void *)data_ptr;
+    if (!tensor) return nullptr;
+    return tensor->data;
 }
 
 static void translate_tensor_recursive(struct ggml_tensor * tensor, std::unordered_map<struct ggml_tensor *, void *> & saved_ptrs) {
@@ -439,38 +410,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         }
 
         if (node->op != GGML_OP_MUL_MAT) {
-            if (backend_ctx->cpu_fallback) {
-                // GGML_LOG_INFO("[%s] Node %d: op=%d (%s) not supported by RKNPU, falling back to CPU\n", __func__, i, (int)node->op, ggml_op_name(node->op));
-                struct ggml_tensor * tmp_nodes[1] = { node };
-                struct ggml_cgraph temp_graph = {};
-                temp_graph.n_nodes = 1;
-                temp_graph.nodes = tmp_nodes;
-
-                std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
-                translate_tensor_recursive(node, saved_ptrs);
-
-                std::unordered_set<struct ggml_tensor *> synced_tensors;
-                sync_tensor_recursive(node, RKNN_MEMORY_SYNC_FROM_DEVICE, synced_tensors);
-
-                ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
-
-                synced_tensors.clear();
-                sync_tensor_recursive(node, RKNN_MEMORY_SYNC_TO_DEVICE, synced_tensors);
-
-                for (auto & pair : saved_ptrs) {
-                    pair.first->data = pair.second;
-                }
-
-                if (status != GGML_STATUS_SUCCESS) {
-                    GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
-                    return status;
-                }
-                // GGML_LOG_INFO("[%s] Node %d: op=%d (%s) CPU fallback successful\n", __func__, i, (int)node->op, ggml_op_name(node->op));
-            }
-            continue;
+            return GGML_STATUS_FAILED; // Let ggml-backend handle fallback
         }
 
-        const auto* op_support = config.find_op_support(w_type, src1 ? src1->type : GGML_TYPE_F32);
+        const auto* op_support = config.find_op_support(w_type);
         if (node->op == GGML_OP_MUL_MAT) {
             bool supported_by_npu = (op_support != nullptr);
 
@@ -642,14 +585,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // Sync src1 to CPU if it's coming from RKNPU but was modified
             if (src1->buffer && src1->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
                 auto * src1_buf_ctx = (ggml_backend_rknpu_buffer_context*)src1->buffer->context;
-                // Since RKNPU memory is DMA, we might need a sync from device to ensure CPU sees it
-                // Actually rknpu_get_system_ptr just returns the virtual address.
-                // We should sync BEFORE reading it on CPU if it was written by NPU.
                 rknn_tensor_mem mem = {};
-                mem.virt_addr = src1_buf_ctx->dma_buf.virt_addr;
+                mem.virt_addr = (void*)src1_data;
                 mem.fd = src1_buf_ctx->dma_buf.fd;
-                mem.size = src1_buf_ctx->dma_buf.size;
-                RKNN_CHECK(rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_FROM_DEVICE), "sync src1 FROM_DEVICE");
+                mem.size = ggml_nbytes(src1);
+                rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
             }
 
             const int row_stride = (int)(src1->nb[1] / ggml_element_size(src1));
@@ -904,8 +844,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     }
     // If there is a specific packing function defined for this tensor type, it's a weight matrix
     // We assume that the packing is the same regardless of activation type (true for currently supported RK3588 ops)
-    const auto* op_support = config.find_op_support(tensor->type, GGML_TYPE_F32);
-    if (!op_support) op_support = config.find_op_support(tensor->type, GGML_TYPE_F16);
+    const auto* op_support = config.find_op_support(tensor->type);
 
     if (op_support && op_support->pack_func) {
         const int K = (int)tensor->ne[0];
@@ -1192,7 +1131,7 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
 
 static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     UNUSED(buft);
-    return 4096;
+    return 64;
 }
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
@@ -1204,27 +1143,25 @@ static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_
 
     // Getting the current device configuration
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
-    const auto* op_support = config.find_op_support(tensor->type, GGML_TYPE_F32);
-    if (!op_support) op_support = config.find_op_support(tensor->type, GGML_TYPE_F16);
+    const auto* op_support = config.find_op_support(tensor->type);
 
-    if (op_support && op_support->pack_func) {
-        const int K = (int)tensor->ne[0];
-        const int N = (int)tensor->ne[1];
+    // Padding Q4_0 weights to the next power of two for Hadamard Transform.
+    if (tensor->type == GGML_TYPE_Q4_0) {
+        if (op_support && op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
+            const int K = (int)tensor->ne[0];
+            const int N = (int)tensor->ne[1];
 
-        auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
-        size_t total_size = 0;
-        for (const auto& seg : segments) {
-            if (seg.size_n > 0) {
-                if (op_support->mm_type == RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32) {
-                    total_size += (size_t)seg.size_n * K * 2;
-                } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT8) {
-                    total_size += (size_t)seg.size_n * K;
-                } else if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                    total_size += (size_t)seg.size_n * K / 2;
+            const int padded_K = rknpu2_calibration::next_power_of_two(K);
+
+            auto segments = compute_matrix_segments(N, config.core_count, op_support->n_align);
+            size_t total_size = 0;
+            for (const auto& seg : segments) {
+                if (seg.size_n > 0) {
+                    total_size += (size_t)seg.size_n * padded_K / 2;
                 }
             }
+            return total_size;
         }
-        return total_size;
     }
 
     // Fallback to default size calculation for other types.
@@ -1323,6 +1260,11 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                  return false;
             }
 
+            // For now, only single batch is supported on NPU in this implementation
+            if (src0->ne[2] > 1 || src1->ne[2] > 1 || src0->ne[3] > 1 || src1->ne[3] > 1) {
+                return false;
+            }
+
             // Checking contiguous memory
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
                 return false;
@@ -1330,6 +1272,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
             return true;
         }
+
         default:
             return false;
     }

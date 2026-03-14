@@ -157,150 +157,20 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .pack_func = */ pack_B_rk3588_fp16
         },
         {
-            /* .type_w    = */ GGML_TYPE_F16,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q8_0,
+            /* .type_w    = */ GGML_TYPE_Q8_0,              // Weights must be converted from Q8_0
             /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .npu_type_a = */ NPU_TYPE_INT8,              // Activations must be converted to INT8
+            /* .npu_type_c = */ NPU_TYPE_INT32,             // Result must be converted from INT32
+            /* .mm_type   = */ RKNN_INT8_MM_INT8_TO_INT32,
             /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
+            /* .n_align   = */ 32,
+            /* .pack_func = */ pack_B_rk3588_int8
         },
         {
-            /* .type_w    = */ GGML_TYPE_Q8_0,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q4_K,
+            /* .type_w    = */ GGML_TYPE_Q4_0,              // Weights must be converted from Q4_0
             /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q4_K,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_K,
-            /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_K,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q6_K,
-            /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q6_K,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_0,
-            /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_0,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_1,
-            /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q5_1,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_FP16,
-            /* .npu_type_c = */ NPU_TYPE_FP32,
-            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 16,
-            /* .pack_func = */ pack_B_rk3588_fp16
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q4_0,              // Native NPU INT4 support
-            /* .type_a    = */ GGML_TYPE_F32,
-            /* .npu_type_a = */ NPU_TYPE_INT4,
-            /* .npu_type_c = */ NPU_TYPE_INT16,
-            /* .mm_type   = */ RKNN_INT4_MM_INT4_TO_INT16,
-            /* .k_align   = */ 32,
-            /* .n_align   = */ 64,
-            /* .pack_func = */ pack_B_rk3588_int4
-        },
-        {
-            /* .type_w    = */ GGML_TYPE_Q4_0,
-            /* .type_a    = */ GGML_TYPE_F16,
-            /* .npu_type_a = */ NPU_TYPE_INT4,
-            /* .npu_type_c = */ NPU_TYPE_INT16,
+            /* .npu_type_a = */ NPU_TYPE_INT4,              // Activations must be converted to INT4
+            /* .npu_type_c = */ NPU_TYPE_INT16,             // Result must be converted from INT16
             /* .mm_type   = */ RKNN_INT4_MM_INT4_TO_INT16,
             /* .k_align   = */ 32,
             /* .n_align   = */ 64,
