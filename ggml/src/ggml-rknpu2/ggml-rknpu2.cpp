@@ -2,6 +2,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
+#include "ggml-cpu.h"
 
 #include "rknpu2-allocation.h"
 #include "rknpu2-quantization.h"
@@ -330,7 +331,7 @@ static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer,
 }
 
 
-static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_type type, size_t offset, size_t size) {
+static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_mode type, size_t offset, size_t size) {
     if (!tensor || !tensor->data || !tensor->buffer || !tensor->buffer->context) return;
     
     // Check if buffer is RKNPU
@@ -378,7 +379,8 @@ static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
 
-    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    GGML_ASSERT(from_float != NULL);
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
         for (int64_t i02 = 0; i02 < ne02; ++i02) {
@@ -430,8 +432,10 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
 
-    ggml_to_float_t   const to_float   = ggml_get_type_traits(src0->type)->to_float;
-    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+    ggml_to_float_t   const to_float   = (src0->type == GGML_TYPE_F32) ? (ggml_to_float_t)ggml_cpu_fp32_to_fp32 : ggml_get_type_traits(src0->type)->to_float;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    GGML_ASSERT(to_float != NULL);
+    GGML_ASSERT(from_float != NULL);
 
     std::vector<float> row_f32(ne00);
     for (int64_t i = 0; i < ggml_nelements(src1); ++i) {
@@ -474,8 +478,10 @@ static void rknpu_compute_forward_cpy(struct ggml_tensor * dst) {
     const size_t nb2 = dst->nb[2];
     const size_t nb3 = dst->nb[3];
 
-    ggml_to_float_t   const to_float   = ggml_get_type_traits(src0->type)->to_float;
-    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+    ggml_to_float_t   const to_float   = (src0->type == GGML_TYPE_F32) ? (ggml_to_float_t)ggml_cpu_fp32_to_fp32 : ggml_get_type_traits(src0->type)->to_float;
+    ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
+    GGML_ASSERT(to_float != NULL);
+    GGML_ASSERT(from_float != NULL);
 
     std::vector<float> row_f32(ne00);
     for (int64_t i03 = 0; i03 < ne03; i03++) {
