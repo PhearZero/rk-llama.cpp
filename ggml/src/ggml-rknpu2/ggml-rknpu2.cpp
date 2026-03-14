@@ -512,7 +512,7 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
                    i, i01, ne01, src1->type, src1->name, src0->name);
             if (i == 0 && src1->data) {
                 const uint8_t * p = (const uint8_t *)src1->data;
-                int n_dump = std::min((int64_t)16, ggml_nbytes(src1));
+                int n_dump = std::min((size_t)16, ggml_nbytes(src1));
                 printf("RKNPU2: get_rows src1[0..%d] (raw hex) = [", n_dump - 1);
                 for (int j = 0; j < n_dump; ++j) {
                     printf(" %02x%s", p[j], (j < n_dump - 1 ? "," : ""));

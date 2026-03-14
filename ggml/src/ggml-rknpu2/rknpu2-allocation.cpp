@@ -58,7 +58,7 @@ DmaBuffer alloc(size_t size) {
 
     close(dma_heap_fd);
 
-    if (buf_data.fd < 0) {
+    if ((int32_t)buf_data.fd < 0) {
         fprintf(stderr, "RKNPU_DMA_ALLOC: IOCTL returned success but invalid fd=%d\n", buf_data.fd);
         buffer.fd = -1;
         return buffer;
