@@ -303,15 +303,21 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer);
 
 static void* ggml_rknpu_get_system_ptr(const struct ggml_tensor* tensor) {
     if (tensor->buffer && tensor->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
-        return (void*)((uintptr_t)ggml_backend_rknpu_buffer_get_base(tensor->buffer) + (uintptr_t)tensor->data - (uintptr_t)ggml_backend_buffer_get_base(tensor->buffer));
+        void* base = ggml_backend_rknpu_buffer_get_base(tensor->buffer);
+        if (base) {
+            return (void*)((uintptr_t)base + (uintptr_t)tensor->data - (uintptr_t)base);
+        }
     }
     return tensor->data;
 }
 
 static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
-    const struct ggml_tensor * base = tensor;
-    while (base->view_src != nullptr) base = base->view_src;
-    return (uint8_t*)base->data - (uint8_t*)ggml_backend_buffer_get_base(buffer);
+    if (!buffer || !tensor) return 0;
+    const struct ggml_tensor * base_tensor = tensor;
+    while (base_tensor->view_src != nullptr) base_tensor = base_tensor->view_src;
+    void* base_addr = ggml_backend_buffer_get_base(buffer);
+    if (!base_addr) return 0;
+    return (uint8_t*)base_tensor->data - (uint8_t*)base_addr;
 }
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
@@ -322,11 +328,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor* node = cgraph->nodes[i];
+        if (!node) continue;
         if (node->op != GGML_OP_MUL_MAT) continue;
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
         struct ggml_tensor* dst = node;
+
+        if (!src0 || !src1) continue;
 
         const ggml_type w_type = src0->type;
 
@@ -382,6 +391,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         {
             ggml_backend_buffer_t src0_buffer = src0->buffer;
+            if (!src0_buffer || !src0_buffer->context) {
+                return GGML_STATUS_FAILED;
+            }
             auto* src0_buf_ctx = (ggml_backend_rknpu_buffer_context*)src0_buffer->context;
             
             // Resolve the base tensor and its offset to use as a cache key
@@ -781,6 +793,7 @@ static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) 
 }
 
 static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
+    if (!buffer || !buffer->context) return nullptr;
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     return ctx->dma_buf.virt_addr;
 }
@@ -792,9 +805,15 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 }
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!buffer || !buffer->context || !tensor) return;
+
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
-    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_buffer_get_base(buffer));
+    if (!dma_base) return;
+
+    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_rknpu_buffer_get_base(buffer));
+    
+    // printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p\n", tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data);
 
     // Getting the current device configuration to drive the packing logic
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
@@ -904,14 +923,23 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!buffer || !buffer->context || !tensor) return;
+
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
-    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_buffer_get_base(buffer));
+    if (!dma_base) return;
+
+    void* base_addr = ggml_backend_rknpu_buffer_get_base(buffer);
+    if (!base_addr) return;
+
+    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)base_addr);
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    if (!buffer || !buffer->context) return;
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+    if (!ctx->dma_buf.virt_addr) return;
     memset(ctx->dma_buf.virt_addr, value, ctx->dma_buf.size);
 }
 
