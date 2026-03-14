@@ -409,6 +409,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             // GGML_LOG_INFO("[%s] Node %d: op=%d (MUL_MAT) M=%d, K=%d, N=%d, type=%d\n", __func__, i, (int)node->op, M, K, N, (int)w_type);
         }
 
+        if (node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue;
+        }
+
         if (node->op != GGML_OP_MUL_MAT) {
             GGML_LOG_ERROR("[%s] Node %d: op=%d (%s) not supported by RKNPU backend\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             return GGML_STATUS_FAILED; // Let ggml-backend handle fallback
@@ -1227,6 +1231,10 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
     switch (op->op) {
         case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
             return true;
 
         case GGML_OP_MUL_MAT: {
