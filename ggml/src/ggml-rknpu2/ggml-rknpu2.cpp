@@ -410,6 +410,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         }
 
         if (node->op != GGML_OP_MUL_MAT) {
+            GGML_LOG_ERROR("[%s] Node %d: op=%d (%s) not supported by RKNPU backend\n", __func__, i, (int)node->op, ggml_op_name(node->op));
             return GGML_STATUS_FAILED; // Let ggml-backend handle fallback
         }
 
