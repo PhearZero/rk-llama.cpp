@@ -65,4 +65,11 @@ void hadamard_transform(float* dst, const float* src, int K, int padded_size);
  */
 int next_power_of_two(int n);
 
+/**
+ * @brief Generates a vector of random signs (-1.0f or 1.0f).
+ * @param size The number of elements to generate.
+ * @return A vector of random signs.
+ */
+std::vector<float> generate_random_sign_vector(int size);
+
 } // namespace rknpu2_calibration

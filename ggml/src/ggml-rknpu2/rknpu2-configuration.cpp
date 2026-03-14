@@ -2,9 +2,7 @@
 
 #include "rknpu2-configuration.h"
 
-#ifdef __ARM_NEON
 #include <arm_neon.h>
-#endif
 
 // --- Anonymous namespace for chip-specific packing functions ---
 
@@ -30,11 +28,10 @@ void pack_B_rk3588_fp16(
             const size_t dst_block = (size_t) i * s0 + (size_t) j * s1;
             for (int ii = 0; ii < 16; ++ii) {
                 const size_t n_global = (size_t)n_offset + (size_t)i * 16 + (size_t)ii;
-
+                
                 const uint16_t * src_ptr = src + n_global * K + j * 32;
                 uint16_t * dst_ptr = dst + dst_block + ii * s2;
 
-#ifdef __ARM_NEON
                 uint16x8_t d0 = vld1q_u16(src_ptr + 0);
                 uint16x8_t d1 = vld1q_u16(src_ptr + 8);
                 uint16x8_t d2 = vld1q_u16(src_ptr + 16);
@@ -44,11 +41,6 @@ void pack_B_rk3588_fp16(
                 vst1q_u16(dst_ptr + 8, d1);
                 vst1q_u16(dst_ptr + 16, d2);
                 vst1q_u16(dst_ptr + 24, d3);
-#else
-                for (int k = 0; k < 32; ++k) {
-                    dst_ptr[k] = src_ptr[k];
-                }
-#endif
             }
         }
     }
@@ -78,17 +70,11 @@ void pack_B_rk3588_int8(
                 const int8_t* src_ptr = src + n_global * K + j * 32;
                 int8_t* dst_ptr = dst + dst_block + ii * s2;
 
-#ifdef __ARM_NEON
                 int8x16_t d0 = vld1q_s8(src_ptr);
                 int8x16_t d1 = vld1q_s8(src_ptr + 16);
 
                 vst1q_s8(dst_ptr, d0);
                 vst1q_s8(dst_ptr + 16, d1);
-#else
-                for (int k = 0; k < 32; ++k) {
-                    dst_ptr[k] = src_ptr[k];
-                }
-#endif
             }
         }
     }
@@ -104,7 +90,7 @@ void pack_B_rk3588_int4(
 
     const size_t s0 = (size_t)(K / 32) * 64 * (32 / 2);
     const size_t s1 = 64 * (32 / 2);
-    const size_t s2 = (32 / 2);
+    const size_t s2 = (32 / 2); 
 
     const size_t src_row_stride_bytes = (size_t)K / 2;
 
@@ -117,14 +103,8 @@ void pack_B_rk3588_int4(
                 const uint8_t* src_ptr = src + n_global * src_row_stride_bytes + (j * 32) / 2;
                 uint8_t* dst_ptr = dst + dst_block + ii * s2;
 
-#ifdef __ARM_NEON
                 uint8x16_t d0 = vld1q_u8(src_ptr);
                 vst1q_u8(dst_ptr, d0);
-#else
-                for (int k = 0; k < 16; ++k) {
-                    dst_ptr[k] = src_ptr[k];
-                }
-#endif
             }
         }
     }
@@ -144,7 +124,7 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     // --- Define RK3588 Configuration ---
     Rknpu2DeviceConfig rk3588_config;
     rk3588_config.device_name = "RK3588";
-    rk3588_config.core_count = 3;
+    rk3588_config.core_count = 1;
     rk3588_config.supported_ops = {
         {
             /* .type_w    = */ GGML_TYPE_F16,               // Weights must be converted from F16
@@ -205,10 +185,7 @@ bool Rknpu2ConfigManager::select_device(const std::string& device_name) {
 }
 
 const Rknpu2DeviceConfig& Rknpu2ConfigManager::get_current_config() const {
-    static Rknpu2DeviceConfig empty_config = {"NONE", 0, {}};
-    if (current_config == nullptr) {
-        return empty_config;
-    }
+    GGML_ASSERT(current_config != nullptr && "No device configuration selected or available.");
     return *current_config;
 }
 

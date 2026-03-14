@@ -17,20 +17,20 @@ namespace rknpu2_quantization {
 // --- Conversion from FP32 ---
 
 /**
- * @brief Converts a row of FP32 values to FP16.
- * @param src Pointer to the source FP32 data.
- * @param dst Pointer to the destination FP16 (uint16_t) data.
- * @param n_elements The number of elements to convert.
- */
-void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements);
-
-/**
  * @brief Converts a row of FP16 values to FP32.
  * @param src Pointer to the source FP16 (uint16_t) data.
  * @param dst Pointer to the destination FP32 data.
  * @param n_elements The number of elements to convert.
  */
 void convert_fp16_to_fp32(const uint16_t * src, float * dst, size_t n_elements);
+
+/**
+ * @brief Converts a row of FP32 values to FP16.
+ * @param src Pointer to the source FP32 data.
+ * @param dst Pointer to the destination FP16 (uint16_t) data.
+ * @param n_elements The number of elements to convert.
+ */
+void convert_fp32_to_fp16(const float * src, uint16_t * dst, size_t n_elements);
 
 /**
  * @brief Symmetrically quantizes a row of FP32 values to INT8.
@@ -45,6 +45,34 @@ void convert_fp16_to_fp32(const uint16_t * src, float * dst, size_t n_elements);
  * @param scale The quantization scale factor.
  */
 void quantize_fp32_to_int8(const float * src, int8_t * dst, size_t n_elements, float scale);
+
+/**
+ * @brief Symmetrically quantizes a row of FP16 values to INT8.
+ *
+ * @param src Pointer to the source FP16 data.
+ * @param dst Pointer to the destination INT8 data.
+ * @param n_elements The number of elements to quantize.
+ * @param scale The quantization scale factor.
+ */
+void quantize_fp16_to_int8(const uint16_t * src, int8_t * dst, size_t n_elements, float scale);
+
+/**
+ * @brief Calculates the maximum absolute value in a row of FP32 values.
+ *
+ * @param src Pointer to the source FP32 data.
+ * @param n_elements The number of elements to process.
+ * @return The maximum absolute value found.
+ */
+float calculate_amax_fp32(const float * src, size_t n_elements);
+
+/**
+ * @brief Calculates the maximum absolute value in a row of FP16 values.
+ *
+ * @param src Pointer to the source FP16 data.
+ * @param n_elements The number of elements to process.
+ * @return The maximum absolute value found.
+ */
+float calculate_amax_fp16(const uint16_t * src, size_t n_elements);
 
 /**
  * @brief Symmetrically quantizes a row of FP32 values to INT4 and packs them.
