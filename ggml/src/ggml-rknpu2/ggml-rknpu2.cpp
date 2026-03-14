@@ -1231,6 +1231,10 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
+            if (!src0 || !src1) {
+                return false;
+            }
+
             // Finding if there is a supported operation for the given weight type
             const auto* op_support = config.find_op_support(src0->type);
             if (!op_support) {

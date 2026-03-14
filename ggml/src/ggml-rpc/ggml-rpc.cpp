@@ -230,6 +230,7 @@ struct rpc_msg_graph_recompute_req {
 struct rpc_msg_supports_op_req {
     uint32_t device;
     rpc_tensor op;
+    rpc_tensor srcs[GGML_MAX_SRC];
 };
 
 struct rpc_msg_supports_op_rsp {
@@ -1196,6 +1197,10 @@ bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
 }
 
 ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor) {
+    if (tensor->id == 0) {
+        return nullptr;
+    }
+
     // Validate tensor type before using it
     if (tensor->type >= GGML_TYPE_COUNT) {
         GGML_LOG_ERROR("[%s] invalid tensor type received: %u\n", __func__, tensor->type);
@@ -1645,6 +1650,12 @@ bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_su
         ggml_free(ctx);
         return false;
     }
+
+    // Link source tensors
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        op->src[i] = deserialize_tensor(ctx, &request.srcs[i]);
+    }
+
     bool supports = ggml_backend_dev_supports_op(dev, op);
     ggml_free(ctx);
     response.result = supports ? 1 : 0;
@@ -2085,9 +2096,15 @@ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const st
     if (sock == nullptr) {
         return false;
     }
-    rpc_msg_supports_op_req request;
-    request.device = ctx->device;
-    request.op = serialize_tensor(op);
+    rpc_msg_supports_op_req request = {
+        /*.device =*/ ctx->device,
+        /*.op     =*/ serialize_tensor(op),
+        /*.srcs   =*/ {},
+    };
+    // serialize source tensors metadata
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        request.srcs[i] = serialize_tensor(op->src[i]);
+    }
     rpc_msg_supports_op_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_SUPPORTS_OP, &request, sizeof(request), &response, sizeof(response));
     if (!status) {
