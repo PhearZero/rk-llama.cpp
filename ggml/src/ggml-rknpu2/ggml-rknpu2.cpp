@@ -574,6 +574,15 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             dst_ptr += segment_packed_size;
                         }
                     }
+                } else {
+                    // Generic fallback for other supported types (e.g. Q5_0, Q4_K, etc.)
+                    // These types have a pack_func that handles the original source data directly.
+                    for (size_t i = 0; i < num_active_segments; ++i) {
+                        const auto& seg = active_segments[i];
+                        size_t segment_packed_size = segments_io_attrs[i].B.size;
+                        op_support->pack_func(dst_ptr, src_ptr, K_orig, N_orig, seg.offset_n, seg.size_n);
+                        dst_ptr += segment_packed_size;
+                    }
                 }
 
                 // Sync the packed weights to the NPU device

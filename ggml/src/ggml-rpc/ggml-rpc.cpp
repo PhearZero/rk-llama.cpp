@@ -108,6 +108,7 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_SUPPORTS_OP,
     RPC_CMD_COUNT,
 };
 
@@ -224,6 +225,15 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+struct rpc_msg_supports_op_req {
+    uint32_t device;
+    rpc_tensor op;
+};
+
+struct rpc_msg_supports_op_rsp {
+    uint8_t result;
 };
 
 #pragma pack(pop)
@@ -1034,6 +1044,7 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response);
 
     struct stored_graph {
         ggml_context_ptr ctx_ptr;
@@ -1617,6 +1628,26 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_supports_op_rsp & response) {
+    uint32_t dev_id = request.device;
+    if (dev_id >= backends.size()) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+    ggml_init_params params = {
+        /* .mem_size   = */ 16 * 1024,
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * op = deserialize_tensor(ctx, &request.op);
+    bool supports = ggml_backend_dev_supports_op(dev, op);
+    ggml_free(ctx);
+    response.result = supports ? 1 : 0;
+    LOG_DBG("[%s] device: %u, op: %s, supports: %d\n", __func__, dev_id, ggml_op_name(op->op), (int)supports);
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto it : buffers) {
         ggml_backend_buffer_free(it.second);
@@ -1884,6 +1915,20 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SUPPORTS_OP: {
+                rpc_msg_supports_op_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_supports_op_rsp response;
+                if (!server.supports_op(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2031,10 +2076,26 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 }
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    //TODO: call the remote backend and cache the results
-    return true;
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    sockfd_t sockfd = ctx->get_sockfd();
+    if (sockfd == INVALID_SOCKET) {
+        return false;
+    }
+    uint8_t cmd = RPC_CMD_SUPPORTS_OP;
+    if (!send_data(sockfd, &cmd, 1)) {
+        return false;
+    }
+    rpc_msg_supports_op_req request;
+    request.device = ctx->device;
+    serialize_tensor(op, &request.op);
+    if (!send_msg(sockfd, &request, sizeof(request))) {
+        return false;
+    }
+    rpc_msg_supports_op_rsp response;
+    if (!recv_msg(sockfd, &response, sizeof(response))) {
+        return false;
+    }
+    return response.result != 0;
 }
 
 static bool ggml_backend_rpc_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {

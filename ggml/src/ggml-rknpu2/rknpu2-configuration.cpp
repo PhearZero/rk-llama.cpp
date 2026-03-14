@@ -1,8 +1,10 @@
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 
 #include "rknpu2-configuration.h"
 
 #include <arm_neon.h>
+#include <cstring>
 
 // --- Anonymous namespace for chip-specific packing functions ---
 
@@ -110,6 +112,56 @@ void pack_B_rk3588_int4(
     }
 }
 
+template <typename T_block, int QK, void (*dequant_row)(const T_block *, float *, int64_t)>
+void pack_any_to_rk3588_fp16(
+    uint8_t* dst_u8, const uint8_t* src_u8,
+    int K, int N_total, int n_offset, int n_segment) {
+
+    auto dst = reinterpret_cast<uint16_t*>(dst_u8);
+
+    const size_t s0 = (size_t)(K / 32) * 16 * 32;
+    const size_t s1 = 16 * 32;
+    const size_t s2 = 32;
+
+    std::vector<float> row_f32(K);
+    std::vector<uint16_t> row_f16(K);
+
+    for (int i = 0; i < n_segment / 16; ++i) {
+        for (int ii = 0; ii < 16; ++ii) {
+            const int n_global = n_offset + i * 16 + ii;
+            const T_block * src_row_ptr = (const T_block *)src_u8 + (size_t)n_global * (K / QK);
+            dequant_row(src_row_ptr, row_f32.data(), K);
+            
+            for (int k = 0; k < K; k++) {
+                row_f16[k] = ggml_fp32_to_fp16(row_f32[k]);
+            }
+
+            const size_t dst_block_base = (size_t) i * s0;
+            for (int j = 0; j < K / 32; ++j) {
+                const size_t dst_block = dst_block_base + (size_t) j * s1;
+                uint16_t * dst_ptr = dst + dst_block + ii * s2;
+                memcpy(dst_ptr, row_f16.data() + j * 32, 32 * sizeof(uint16_t));
+            }
+        }
+    }
+}
+
+void pack_B_rk3588_q5_0(uint8_t* d, const uint8_t* s, int K, int NT, int no, int ns) {
+    pack_any_to_rk3588_fp16<block_q5_0, 32, dequantize_row_q5_0>(d, s, K, NT, no, ns);
+}
+
+void pack_B_rk3588_q4_K(uint8_t* d, const uint8_t* s, int K, int NT, int no, int ns) {
+    pack_any_to_rk3588_fp16<block_q4_K, 256, dequantize_row_q4_K>(d, s, K, NT, no, ns);
+}
+
+void pack_B_rk3588_q5_K(uint8_t* d, const uint8_t* s, int K, int NT, int no, int ns) {
+    pack_any_to_rk3588_fp16<block_q5_K, 256, dequantize_row_q5_K>(d, s, K, NT, no, ns);
+}
+
+void pack_B_rk3588_q6_K(uint8_t* d, const uint8_t* s, int K, int NT, int no, int ns) {
+    pack_any_to_rk3588_fp16<block_q6_K, 256, dequantize_row_q6_K>(d, s, K, NT, no, ns);
+}
+
 } // anonymous namespace
 
 
@@ -155,6 +207,46 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
             /* .k_align   = */ 32,
             /* .n_align   = */ 64,
             /* .pack_func = */ pack_B_rk3588_int4
+        },
+        {
+            /* .type_w    = */ GGML_TYPE_Q5_0,
+            /* .type_a    = */ GGML_TYPE_F32,
+            /* .npu_type_a = */ NPU_TYPE_FP16,
+            /* .npu_type_c = */ NPU_TYPE_FP32,
+            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align   = */ 32,
+            /* .n_align   = */ 16,
+            /* .pack_func = */ pack_B_rk3588_q5_0
+        },
+        {
+            /* .type_w    = */ GGML_TYPE_Q4_K,
+            /* .type_a    = */ GGML_TYPE_F32,
+            /* .npu_type_a = */ NPU_TYPE_FP16,
+            /* .npu_type_c = */ NPU_TYPE_FP32,
+            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align   = */ 32,
+            /* .n_align   = */ 16,
+            /* .pack_func = */ pack_B_rk3588_q4_K
+        },
+        {
+            /* .type_w    = */ GGML_TYPE_Q5_K,
+            /* .type_a    = */ GGML_TYPE_F32,
+            /* .npu_type_a = */ NPU_TYPE_FP16,
+            /* .npu_type_c = */ NPU_TYPE_FP32,
+            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align   = */ 32,
+            /* .n_align   = */ 16,
+            /* .pack_func = */ pack_B_rk3588_q5_K
+        },
+        {
+            /* .type_w    = */ GGML_TYPE_Q6_K,
+            /* .type_a    = */ GGML_TYPE_F32,
+            /* .npu_type_a = */ NPU_TYPE_FP16,
+            /* .npu_type_c = */ NPU_TYPE_FP32,
+            /* .mm_type   = */ RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32,
+            /* .k_align   = */ 32,
+            /* .n_align   = */ 16,
+            /* .pack_func = */ pack_B_rk3588_q6_K
         }
     };
     device_configs["RK3588"] = rk3588_config;
