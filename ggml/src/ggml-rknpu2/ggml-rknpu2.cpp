@@ -436,39 +436,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             }
 
             if (!supported_by_npu || !is_packed) {
-                if (backend_ctx->cpu_fallback) {
-                    GGML_LOG_DEBUG("[%s] Node %d: op=%d (MUL_MAT) %s, falling back to CPU\n",
-                                  __func__, i, (int)node->op, !supported_by_npu ? "type not supported" : "src0 is not packed");
-                    struct ggml_tensor * tmp_nodes[1] = { node };
-                    struct ggml_cgraph temp_graph = {};
-                    temp_graph.n_nodes = 1;
-                    temp_graph.nodes = tmp_nodes;
-
-                    std::unordered_map<struct ggml_tensor *, void *> saved_ptrs;
-                    translate_tensor_recursive(node, saved_ptrs);
-
-                    std::unordered_set<struct ggml_tensor *> synced_tensors;
-                    sync_tensor_recursive(node, RKNN_MEMORY_SYNC_FROM_DEVICE, synced_tensors);
-
-                    ggml_status status = ggml_backend_graph_compute(backend_ctx->cpu_fallback, &temp_graph);
-
-                    synced_tensors.clear();
-                    sync_tensor_recursive(node, RKNN_MEMORY_SYNC_TO_DEVICE, synced_tensors);
-
-                    for (auto & pair : saved_ptrs) {
-                        pair.first->data = pair.second;
-                    }
-
-                    if (status != GGML_STATUS_SUCCESS) {
-                        GGML_LOG_ERROR("[%s] CPU fallback failed for node %d (op=%d)\n", __func__, i, (int)node->op);
-                        return status;
-                    }
-                } else {
-                    GGML_LOG_ERROR("[%s] Node %d: op=%d (MUL_MAT) %s and no CPU fallback available\n",
-                                   __func__, i, (int)node->op, !supported_by_npu ? "type not supported" : "src0 is not packed");
-                    return GGML_STATUS_FAILED;
-                }
-                continue;
+                return GGML_STATUS_FAILED;
             }
         }
 
@@ -1238,7 +1206,6 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             return true;
 
         case GGML_OP_MUL_MAT: {
-            return false; // TEMPORARILY DISABLE ALL MUL_MAT ON NPU
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
