@@ -333,6 +333,7 @@ static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer,
 
 static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_mode type, size_t offset, size_t size) {
     if (!tensor || !tensor->data || !tensor->buffer || !tensor->buffer->context) return;
+    if (size == 0) return;
     
     // Check if buffer is RKNPU
     const char * name = ggml_backend_buffer_name(tensor->buffer);
@@ -341,21 +342,35 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)tensor->buffer->context;
     if (!ctx->dma_buf.virt_addr) return;
     
+    size_t tensor_offset = ggml_backend_rknpu_get_tensor_offset(tensor->buffer, tensor);
+    size_t total_offset = tensor_offset + offset;
+
     rknn_tensor_mem sync_mem = {};
-    sync_mem.virt_addr = (void*)((uint8_t*)tensor->data + offset);
+    sync_mem.virt_addr = (void*)((uint8_t*)ctx->dma_buf.virt_addr + total_offset);
     sync_mem.fd = ctx->dma_buf.fd;
+    sync_mem.offset = (uint32_t)total_offset;
     sync_mem.size = (uint32_t)size;
     
     auto mem_ctx = get_rknpu_memory_context().get_ctx();
     if (mem_ctx != 0) {
-        rknn_mem_sync(mem_ctx, &sync_mem, type);
+        int ret = rknn_mem_sync(mem_ctx, &sync_mem, type);
+        if (ret != 0) {
+            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, offset=%zu, size=%zu\n",
+                ret, tensor->name, (int)type, total_offset, size);
+            fflush(stdout);
+        }
     }
 }
 
 static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0]; // new rows
     const struct ggml_tensor * src1 = dst->src[1]; // indices
-    const struct ggml_tensor * src2 = dst->src[2]; // cache
+    const struct ggml_tensor * src2 = dst->src[2]; // original cache (dst is a view of this)
+
+    if (src0->data == NULL || src1->data == NULL || src2->data == NULL || dst->data == NULL) {
+        printf("RKNPU2: set_rows NULL DATA: src0=%p, src1=%p, src2=%p, dst=%p\n", src0->data, src1->data, src2->data, dst->data);
+        return;
+    }
 
     rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
     rknpu_sync_tensor(src1, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src1));
@@ -392,10 +407,18 @@ static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
                 int64_t i1;
                 if (src1->type == GGML_TYPE_I32) {
                     i1 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-                } else {
+                } else if (src1->type == GGML_TYPE_I64) {
                     i1 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                } else {
+                    printf("RKNPU2: set_rows INVALID src1 type=%d, name=%s\n", src1->type, src1->name);
+                    GGML_ABORT("unsupported src1 type");
                 }
 
+                if (i1 < 0 || i1 >= ne1) {
+                    printf("RKNPU2: set_rows index OUT OF BOUNDS: i=%ld, i1=%ld, ne1=%ld, src1_type=%d, src1_name=%s\n",
+                           i, i1, ne1, src1->type, src1->name);
+                    fflush(stdout);
+                }
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
                 from_float(
@@ -411,6 +434,11 @@ static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
 static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
+
+    if (src0->data == NULL || src1->data == NULL || dst->data == NULL) {
+        printf("RKNPU2: get_rows NULL DATA: src0=%p, src1=%p, dst=%p\n", src0->data, src1->data, dst->data);
+        return;
+    }
 
     rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
     rknpu_sync_tensor(src1, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src1));
@@ -446,10 +474,18 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
         int64_t i01;
         if (src1->type == GGML_TYPE_I32) {
             i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
-        } else {
+        } else if (src1->type == GGML_TYPE_I64) {
             i01 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        } else {
+            printf("RKNPU2: get_rows INVALID src1 type=%d, name=%s\n", src1->type, src1->name);
+            GGML_ABORT("unsupported src1 type");
         }
 
+        if (i01 < 0 || i01 >= ne01) {
+            printf("RKNPU2: get_rows index OUT OF BOUNDS: i=%ld, i01=%ld, ne01=%ld, src1_type=%d, src1_name=%s, src0_name=%s\n",
+                   i, i01, ne01, src1->type, src1->name, src0->name);
+            fflush(stdout);
+        }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         to_float((const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03), row_f32.data(), ne00);
@@ -461,6 +497,11 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
 
 static void rknpu_compute_forward_cpy(struct ggml_tensor * dst) {
     const struct ggml_tensor * src0 = dst->src[0];
+
+    if (src0->data == NULL || dst->data == NULL) {
+        printf("RKNPU2: cpy NULL DATA: src0=%p, dst=%p\n", src0->data, dst->data);
+        return;
+    }
 
     rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
     rknpu_sync_tensor(dst, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(dst));
