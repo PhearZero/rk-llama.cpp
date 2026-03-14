@@ -302,22 +302,20 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
 static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer);
 
 static void* ggml_rknpu_get_system_ptr(const struct ggml_tensor* tensor) {
-    if (tensor->buffer && tensor->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
+    if (tensor && tensor->buffer && tensor->buffer->iface.get_base == ggml_backend_rknpu_buffer_get_base) {
         void* base = ggml_backend_rknpu_buffer_get_base(tensor->buffer);
-        if (base) {
+        if (base && tensor->data) {
             return (void*)((uintptr_t)base + (uintptr_t)tensor->data - (uintptr_t)base);
         }
     }
-    return tensor->data;
+    return tensor ? tensor->data : nullptr;
 }
 
 static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
-    if (!buffer || !tensor) return 0;
-    const struct ggml_tensor * base_tensor = tensor;
-    while (base_tensor->view_src != nullptr) base_tensor = base_tensor->view_src;
-    void* base_addr = ggml_backend_buffer_get_base(buffer);
+    if (!buffer || !tensor || !tensor->data) return 0;
+    void* base_addr = ggml_backend_rknpu_buffer_get_base(buffer);
     if (!base_addr) return 0;
-    return (uint8_t*)base_tensor->data - (uint8_t*)base_addr;
+    return (uint8_t*)tensor->data - (uint8_t*)base_addr;
 }
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
@@ -992,6 +990,7 @@ static size_t ggml_backend_rknpu_buffer_type_get_alignment(ggml_backend_buffer_t
 
 static size_t ggml_backend_rknpu_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
     UNUSED(buft);
+    if (!tensor) return 0;
 
     // Getting the current device configuration
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
