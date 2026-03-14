@@ -1641,6 +1641,10 @@ bool rpc_server::supports_op(const rpc_msg_supports_op_req & request, rpc_msg_su
     };
     struct ggml_context * ctx = ggml_init(params);
     ggml_tensor * op = deserialize_tensor(ctx, &request.op);
+    if (op == nullptr) {
+        ggml_free(ctx);
+        return false;
+    }
     bool supports = ggml_backend_dev_supports_op(dev, op);
     ggml_free(ctx);
     response.result = supports ? 1 : 0;
@@ -2077,22 +2081,16 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
-    sockfd_t sockfd = ctx->get_sockfd();
-    if (sockfd == INVALID_SOCKET) {
-        return false;
-    }
-    uint8_t cmd = RPC_CMD_SUPPORTS_OP;
-    if (!send_data(sockfd, &cmd, 1)) {
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr) {
         return false;
     }
     rpc_msg_supports_op_req request;
     request.device = ctx->device;
-    serialize_tensor(op, &request.op);
-    if (!send_msg(sockfd, &request, sizeof(request))) {
-        return false;
-    }
+    request.op = serialize_tensor(op);
     rpc_msg_supports_op_rsp response;
-    if (!recv_msg(sockfd, &response, sizeof(response))) {
+    bool status = send_rpc_cmd(sock, RPC_CMD_SUPPORTS_OP, &request, sizeof(request), &response, sizeof(response));
+    if (!status) {
         return false;
     }
     return response.result != 0;

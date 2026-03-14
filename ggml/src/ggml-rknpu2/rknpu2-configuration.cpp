@@ -117,6 +117,7 @@ void pack_any_to_rk3588_fp16(
     uint8_t* dst_u8, const uint8_t* src_u8,
     int K, int N_total, int n_offset, int n_segment) {
 
+    (void)N_total;
     auto dst = reinterpret_cast<uint16_t*>(dst_u8);
 
     const size_t s0 = (size_t)(K / 32) * 16 * 32;

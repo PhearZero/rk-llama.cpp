@@ -148,7 +148,7 @@ struct rknpu_memory_context {
     }
 };
 
-rknpu_memory_context & get_rknpu_memory_context() {
+static rknpu_memory_context & get_rknpu_memory_context() {
     static rknpu_memory_context instance;
     return instance;
 }
@@ -287,6 +287,7 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     const std::tuple<int, int, int>& key,
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
 ) {
+    (void)matmul_ctx;
     std::lock_guard<std::mutex> lock(backend_ctx->mutex);
     auto it = cache.find(key);
     if (it != cache.end()) {
@@ -1019,7 +1020,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         sync_mem.size = size;
         auto mem_ctx = get_rknpu_memory_context().get_ctx();
         if (mem_ctx != 0) {
-            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, size=%zu\n", (void*)mem_ctx, sync_mem.fd, sync_mem.size);
+            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.size);
             fflush(stdout);
             int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
             if (ret != 0) {
@@ -1036,7 +1037,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     if (!buffer || !buffer->context || !tensor || !tensor->data) {
         if (!tensor || !tensor->data) {
-            printf("RKNPU2: get_tensor INVALID ARGS: buffer=%p, tensor=%p, data=%p\n", (void*)buffer, (void*)tensor, (void*)(tensor ? tensor->data : NULL));
+            printf("RKNPU2: get_tensor INVALID ARGS: buffer=%p, tensor=%p, data=%p\n", (void*)buffer, (const void*)tensor, (void*)(tensor ? tensor->data : NULL));
             fflush(stdout);
         }
         return;
