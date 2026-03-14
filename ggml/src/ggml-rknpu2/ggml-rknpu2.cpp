@@ -174,12 +174,10 @@ struct ggml_backend_rknpu_context {
     std::shared_ptr<rknpu_matmul_context> get_matmul_ctx(int M, int K, int N, int core_id, rknn_matmul_type type) {
         std::lock_guard<std::mutex> lock(mutex);
         auto key = std::make_tuple(M, K, N, core_id, (int)type);
-        /*
         auto it = matmul_ctx_cache.find(key);
         if (it != matmul_ctx_cache.end()) {
             return it->second;
         }
-        */
         printf("RKNPU2: Creating new matmul context M=%d, K=%d, N=%d, type=%d, cache_size=%zu\n", M, K, N, (int)type, matmul_ctx_cache.size());
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type);
         if (ctx->ctx == 0) {
@@ -218,7 +216,9 @@ struct rknpu_memory_context {
         dummy_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
 
         rknn_matmul_io_attr dummy_io_attr;
+        printf("RKNPU_INIT: Calling rknn_matmul_create...\n");
         int ret = rknn_matmul_create(&mem_ctx, &dummy_info, &dummy_io_attr);
+        printf("RKNPU_INIT: rknn_matmul_create returned: %d, ctx: %p\n", ret, (void*)mem_ctx);
         if (ret < 0) mem_ctx = 0;
     }
 
@@ -1023,10 +1023,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
                  return false;
             }
 
-            // CPU fallback for batched matmuls (M > 1) to avoid driver crashes
-            if (src1->ne[1] > 1) {
-                return false;
-            }
+            // Removed CPU fallback for batched matmuls (M > 1) to enable RKNPU offloading
 
             // Checking contiguous memory
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {

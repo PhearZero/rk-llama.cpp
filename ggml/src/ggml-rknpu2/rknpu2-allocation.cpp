@@ -33,6 +33,7 @@ DmaBuffer alloc(size_t size) {
     buffer.size = size;
 
     const char* path = "/dev/dma_heap/system";
+    printf("RKNPU_DMA_ALLOC: Attempting to allocate %zu bytes from %s...\n", size, path);
     int dma_heap_fd = open(path, O_RDWR);
     if (dma_heap_fd < 0) {
         fprintf(stderr, "RKNPU_DMA_ALLOC: Failed to open %s: %s\n", path, strerror(errno));
@@ -45,10 +46,11 @@ DmaBuffer alloc(size_t size) {
     buf_data.fd_flags = O_CLOEXEC | O_RDWR;
 
     if (ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data) < 0) {
-        fprintf(stderr, "RKNPU_DMA_ALLOC: ioctl DMA_HEAP_IOCTL_ALLOC failed: %s\n", strerror(errno));
+        fprintf(stderr, "RKNPU_DMA_ALLOC: ioctl DMA_HEAP_IOCTL_ALLOC failed for size %zu: %s\n", size, strerror(errno));
         close(dma_heap_fd);
         return buffer;
     }
+    printf("RKNPU_DMA_ALLOC: SUCCESS, fd=%d, size=%zu\n", buf_data.fd, size);
 
     close(dma_heap_fd);
 
