@@ -707,6 +707,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 packed_mem = std::shared_ptr<rknn_tensor_mem>(mem_ptr, ggml_backend_rknpu_buffer_context::rknn_tensor_mem_deleter{});
 
                 // Pack the data from the original DMA buffer into the new NPU buffer
+                rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
                 uint8_t* src_ptr = (uint8_t*)src0_buf_ctx->dma_buf.virt_addr + tensor_offset;
                 uint8_t* dst_ptr = (uint8_t*)packed_mem->virt_addr;
 
@@ -1242,10 +1243,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         rknn_tensor_mem sync_mem = {};
         sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
         sync_mem.fd = ctx->dma_buf.fd;
-        sync_mem.size = size;
+        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
+        sync_mem.size = (uint32_t)size;
         auto mem_ctx = get_rknpu_memory_context().get_ctx();
         if (mem_ctx != 0) {
-            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.size);
+            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, offset=%u, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.offset, sync_mem.size);
             fflush(stdout);
             int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
             if (ret != 0) {
@@ -1294,10 +1296,15 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         rknn_tensor_mem sync_mem = {};
         sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
         sync_mem.fd = ctx->dma_buf.fd;
+        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
         sync_mem.size = (uint32_t)size;
         auto mem_ctx = get_rknpu_memory_context().get_ctx();
         if (mem_ctx != 0) {
-            rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+            int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+            if (ret != 0) {
+                printf("RKNPU2: get_tensor rknn_mem_sync FAILED, ret=%d\n", ret);
+                fflush(stdout);
+            }
         }
     }
 
@@ -1311,6 +1318,17 @@ static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_
     printf("RKNPU2: clear buffer=%p, size=%zu, value=%u\n", (void*)buffer, ctx->dma_buf.size, value);
     fflush(stdout);
     memset(ctx->dma_buf.virt_addr, value, ctx->dma_buf.size);
+
+    // Sync to device after clearing
+    rknn_tensor_mem sync_mem = {};
+    sync_mem.virt_addr = ctx->dma_buf.virt_addr;
+    sync_mem.fd = ctx->dma_buf.fd;
+    sync_mem.offset = 0;
+    sync_mem.size = (uint32_t)ctx->dma_buf.size;
+    auto mem_ctx = get_rknpu_memory_context().get_ctx();
+    if (mem_ctx != 0) {
+        rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    }
 }
 
 
