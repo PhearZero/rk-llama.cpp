@@ -338,7 +338,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // Bucket 1: Generation (M=1)
         // Bucket 2: Small Prefill (M <= 8, use 8 for stability)
         // Bucket 3: Medium Prefill (M <= 512, use 512 for stability)
-        const int M_op = (M == 1) ? 1 : (M <= 8 ? 8 : (M <= 512 ? 512 : ((M + 7) / 8 * 8)));
+        const int M_op = (M == 1) ? 1 : (M <= 32 ? (M <= 8 ? 8 : 32) : (M <= 512 ? 512 : ((M + 7) / 8 * 8)));
 
         const bool is_q4_hadamard = (src0->type == GGML_TYPE_Q4_0);
         const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
