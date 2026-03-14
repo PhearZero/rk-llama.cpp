@@ -29,6 +29,7 @@
 #include <random>
 #include <limits>
 #include <fstream>
+#include <sys/sysinfo.h>
 #include <cstdio>
 
 #define UNUSED(x) (void)(x)
@@ -794,7 +795,7 @@ static void ggml_backend_rknpu_buffer_free_buffer(ggml_backend_buffer_t buffer) 
 }
 
 static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
-    if (!buffer || !buffer->context) return nullptr;
+    if (!buffer || !buffer->context) return NULL;
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     return ctx->dma_buf.virt_addr;
 }
@@ -806,7 +807,13 @@ static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffe
 }
 
 static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
-    if (!buffer || !buffer->context || !tensor) return;
+    if (!buffer || !buffer->context || !tensor || !tensor->data) {
+        if (!tensor || !tensor->data) {
+            printf("RKNPU2: set_tensor INVALID ARGS: buffer=%p, tensor=%p, data=%p\n", (void*)buffer, (void*)tensor, (void*)(tensor ? tensor->data : NULL));
+            fflush(stdout);
+        }
+        return;
+    }
 
     auto * ctx = (ggml_backend_rknpu_buffer_context *) buffer->context;
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
@@ -815,11 +822,19 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     void* base_addr = ggml_backend_rknpu_buffer_get_base(buffer);
     if (!base_addr) return;
 
-    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)base_addr);
+    const size_t tensor_offset_in_buffer = (uint8_t*)tensor->data - (uint8_t*)base_addr;
+    if (tensor_offset_in_buffer + offset + size > ctx->dma_buf.size) {
+        fprintf(stderr, "RKNPU2: set_tensor OUT OF BOUNDS! buffer_size=%zu, offset_in_buffer=%zu, offset=%zu, size=%zu\n", 
+                ctx->dma_buf.size, tensor_offset_in_buffer, offset, size);
+        fflush(stderr);
+        return;
+    }
+
+    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
     
-    // printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p, target=%p\n", 
-    //        tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
-    // fflush(stdout);
+    printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p, target=%p\n", 
+           tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
+    fflush(stdout);
 
     // Getting the current device configuration to drive the packing logic
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
@@ -932,7 +947,13 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
-    if (!buffer || !buffer->context || !tensor) return;
+    if (!buffer || !buffer->context || !tensor || !tensor->data) {
+        if (!tensor || !tensor->data) {
+            printf("RKNPU2: get_tensor INVALID ARGS: buffer=%p, tensor=%p, data=%p\n", (void*)buffer, (void*)tensor, (void*)(tensor ? tensor->data : NULL));
+            fflush(stdout);
+        }
+        return;
+    }
 
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
@@ -941,17 +962,19 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     void* base_addr = ggml_backend_rknpu_buffer_get_base(buffer);
     if (!base_addr) return;
 
-    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)base_addr);
-    
-    // Safety check for memcpy
-    const size_t buffer_size = ctx->dma_buf.size;
-    const size_t tensor_offset_in_buffer = (uint8_t*)tensor_dma_ptr - dma_base;
-    
-    if (tensor_offset_in_buffer + offset + size > buffer_size) {
+    const size_t tensor_offset_in_buffer = (uint8_t*)tensor->data - (uint8_t*)base_addr;
+    if (tensor_offset_in_buffer + offset + size > ctx->dma_buf.size) {
         fprintf(stderr, "RKNPU2: get_tensor OUT OF BOUNDS! buffer_size=%zu, offset_in_buffer=%zu, offset=%zu, size=%zu\n", 
-                buffer_size, tensor_offset_in_buffer, offset, size);
+                ctx->dma_buf.size, tensor_offset_in_buffer, offset, size);
+        fflush(stderr);
         return;
     }
+
+    uint8_t* tensor_dma_ptr = dma_base + tensor_offset_in_buffer;
+    
+    printf("RKNPU2: get_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p, target=%p\n", 
+           tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
+    fflush(stdout);
 
     memcpy(data, tensor_dma_ptr + offset, size);
 }
@@ -960,6 +983,8 @@ static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_
     if (!buffer || !buffer->context) return;
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     if (!ctx->dma_buf.virt_addr) return;
+    printf("RKNPU2: clear buffer=%p, size=%zu, value=%u\n", (void*)buffer, ctx->dma_buf.size, value);
+    fflush(stdout);
     memset(ctx->dma_buf.virt_addr, value, ctx->dma_buf.size);
 }
 
