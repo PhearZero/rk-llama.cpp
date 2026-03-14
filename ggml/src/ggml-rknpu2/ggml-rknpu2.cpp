@@ -169,7 +169,10 @@ struct ggml_backend_rknpu_buffer_context {
             if (mem) {
                 // RKNN view handles created via rknn_create_mem_from_fd 
                 // must also be destroyed, but we use a single context for all memory operations.
-                rknn_destroy_mem(get_rknpu_memory_context().get_ctx(), mem);
+                auto mem_ctx = get_rknpu_memory_context().get_ctx();
+                if (mem_ctx != 0) {
+                    rknn_destroy_mem(mem_ctx, mem);
+                }
             }
         }
     };
@@ -809,10 +812,14 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     uint8_t* dma_base = (uint8_t*)ctx->dma_buf.virt_addr;
     if (!dma_base) return;
 
-    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_rknpu_buffer_get_base(buffer));
+    void* base_addr = ggml_backend_rknpu_buffer_get_base(buffer);
+    if (!base_addr) return;
+
+    uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)base_addr);
     
     // printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p, target=%p\n", 
     //        tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
+    // fflush(stdout);
 
     // Getting the current device configuration to drive the packing logic
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
@@ -918,7 +925,10 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
     sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
     sync_mem.fd = ctx->dma_buf.fd;
     sync_mem.size = size;
-    rknn_mem_sync(get_rknpu_memory_context().get_ctx(), &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    auto mem_ctx = get_rknpu_memory_context().get_ctx();
+    if (mem_ctx != 0) {
+        rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    }
 }
 
 static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -932,6 +942,17 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
     if (!base_addr) return;
 
     uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)base_addr);
+    
+    // Safety check for memcpy
+    const size_t buffer_size = ctx->dma_buf.size;
+    const size_t tensor_offset_in_buffer = (uint8_t*)tensor_dma_ptr - dma_base;
+    
+    if (tensor_offset_in_buffer + offset + size > buffer_size) {
+        fprintf(stderr, "RKNPU2: get_tensor OUT OF BOUNDS! buffer_size=%zu, offset_in_buffer=%zu, offset=%zu, size=%zu\n", 
+                buffer_size, tensor_offset_in_buffer, offset, size);
+        return;
+    }
+
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
@@ -962,7 +983,11 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
         return NULL;
     }
 
+    printf("RKNPU2: Creating buffer context object (size=%zu)... fflush next\n", sizeof(ggml_backend_rknpu_buffer_context));
+    fflush(stdout);
     ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context();
+    printf("RKNPU2: Buffer context object created at %p\n", (void*)ctx);
+    fflush(stdout);
     ctx->dma_buf = dma_buf;
     ctx->name = "rknpu_dma_buffer";
 
@@ -979,6 +1004,9 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
         /* .clear         = */ ggml_backend_rknpu_buffer_clear,
         /* .reset         = */ NULL,
     };
+
+    // always flush stdout for RPC server logs to avoid missing them during crash
+    fflush(stdout);
 
     return ggml_backend_buffer_init(buft, rknpu_buffer_interface, ctx, size);
 }
