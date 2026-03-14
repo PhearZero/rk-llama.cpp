@@ -836,6 +836,12 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
            tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
     fflush(stdout);
 
+    if (!data) {
+        printf("RKNPU2: set_tensor data is NULL, skipping memcpy/sync\n");
+        fflush(stdout);
+        return;
+    }
+
     // Getting the current device configuration to drive the packing logic
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
     const auto* op_support = config.find_op_support(tensor->type);
@@ -933,16 +939,36 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     // ALWAYS copy the original raw data to the DMA buffer.
     // This allows CPU nodes to work with the data in its original format.
-    memcpy(tensor_dma_ptr + offset, data, size);
+    if (size > 0) {
+        printf("RKNPU2: set_tensor calling memcpy target=%p, src=%p, size=%zu\n", (void*)(tensor_dma_ptr + offset), data, size);
+        fflush(stdout);
+        memcpy(tensor_dma_ptr + offset, data, size);
+        printf("RKNPU2: set_tensor memcpy SUCCESS\n");
+        fflush(stdout);
+    } else {
+        printf("RKNPU2: set_tensor size is 0, skipping memcpy\n");
+        fflush(stdout);
+    }
 
     // Syncing the raw data to the NPU
-    rknn_tensor_mem sync_mem = {};
-    sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
-    sync_mem.fd = ctx->dma_buf.fd;
-    sync_mem.size = size;
-    auto mem_ctx = get_rknpu_memory_context().get_ctx();
-    if (mem_ctx != 0) {
-        rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+    if (size > 0) {
+        rknn_tensor_mem sync_mem = {};
+        sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
+        sync_mem.fd = ctx->dma_buf.fd;
+        sync_mem.size = size;
+        auto mem_ctx = get_rknpu_memory_context().get_ctx();
+        if (mem_ctx != 0) {
+            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, size=%zu\n", (void*)mem_ctx, sync_mem.fd, sync_mem.size);
+            fflush(stdout);
+            int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
+            if (ret != 0) {
+                printf("RKNPU2: rknn_mem_sync FAILED, ret=%d\n", ret);
+                fflush(stdout);
+            } else {
+                printf("RKNPU2: set_tensor rknn_mem_sync SUCCESS\n");
+                fflush(stdout);
+            }
+        }
     }
 }
 
