@@ -161,13 +161,13 @@ struct ggml_backend_rknpu_context {
     std::string name;
     std::mutex mutex;
 
-    // RKNN matmul contexts cache
+    // RKNN matmul contexts cache (M_supported, K, N, core_id, type)
     std::unordered_map<std::tuple<int, int, int, int, int>, std::shared_ptr<rknpu_matmul_context>, TupleHasher> matmul_ctx_cache;
 
     // B-matrices handle cache (from fd)
     std::unordered_map<std::pair<ggml_backend_buffer_t, size_t>, std::shared_ptr<rknn_tensor_mem>, PairHasher> b_mem_handle_cache;
 
-    // A- and C-matrices cache (from create_mem)
+    // A- and C-matrices cache (M, K, type) or (M, size_n, core_id)
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> a_buffer_cache;
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher> c_buffer_cache;
 
@@ -178,7 +178,7 @@ struct ggml_backend_rknpu_context {
         if (it != matmul_ctx_cache.end()) {
             return it->second;
         }
-        printf("RKNPU2: Creating new matmul context M=%d, K=%d, N=%d, type=%d, cache_size=%zu\n", M, K, N, (int)type, matmul_ctx_cache.size());
+        // printf("RKNPU2: Creating new matmul context M=%d, K=%d, N=%d, type=%d, core=%d, cache_size=%zu\n", M, K, N, (int)type, core_id, matmul_ctx_cache.size());
         auto ctx = std::make_shared<rknpu_matmul_context>(M, K, N, type);
         if (ctx->ctx == 0) {
             return nullptr;
@@ -193,10 +193,10 @@ struct ggml_backend_rknpu_context {
         }
 
         int ret = rknn_matmul_set_core_mask(ctx->ctx, core_mask);
-        if (ret != RKNN_SUCC) {
-            // Handle error
+        if (ret < 0) {
+            printf("RKNPU2: Failed to set core mask! error=%d\n", ret);
         }
-
+        
         matmul_ctx_cache[key] = ctx;
         return ctx;
     }
@@ -216,9 +216,9 @@ struct rknpu_memory_context {
         dummy_info.type = RKNN_FLOAT16_MM_FLOAT16_TO_FLOAT32;
 
         rknn_matmul_io_attr dummy_io_attr;
-        printf("RKNPU_INIT: Calling rknn_matmul_create...\n");
+        // printf("RKNPU_INIT: Calling rknn_matmul_create...\n");
         int ret = rknn_matmul_create(&mem_ctx, &dummy_info, &dummy_io_attr);
-        printf("RKNPU_INIT: rknn_matmul_create returned: %d, ctx: %p\n", ret, (void*)mem_ctx);
+        // printf("RKNPU_INIT: rknn_matmul_create returned: %d, ctx: %p\n", ret, (void*)mem_ctx);
         if (ret < 0) mem_ctx = 0;
     }
 
@@ -264,12 +264,10 @@ static std::shared_ptr<rknn_tensor_mem> get_or_create_npu_buffer(
     std::unordered_map<std::tuple<int, int, int>, std::shared_ptr<rknn_tensor_mem>, TupleHasher>& cache
 ) {
     std::lock_guard<std::mutex> lock(backend_ctx->mutex);
-    /*
     auto it = cache.find(key);
     if (it != cache.end()) {
         return it->second;
     }
-    */
 
     if (size == 0) return nullptr;
     rknn_tensor_mem* mem = rknn_create_mem(matmul_ctx, size);
@@ -316,7 +314,14 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int K = (int)src0->ne[0];
         const int N = (int)src0->ne[1];
 
-        printf("RKNPU2: MUL_MAT node=%s, M=%d, K=%d, N=%d, type=%s\n", node->name, M, K, N, ggml_type_name(src0->type));
+        // M rounding for driver stability and context reuse
+        // Bucket 1: Generation (M=1)
+        // Bucket 2: Small Prefill (M <= 8, use 8 for stability)
+        // Bucket 3: Medium Prefill (M <= 512, use 512 for stability)
+        const int M_op = (M == 1) ? 1 : (M <= 8 ? 8 : (M <= 512 ? 512 : ((M + 7) / 8 * 8)));
+
+// Removed printf for performance
+// printf("RKNPU2: MUL_MAT node=%s, M=%d, K=%d, N=%d, type=%s\n", node->name, M, K, N, ggml_type_name(src0->type));
 
         const bool is_q4_hadamard = (src0->type == GGML_TYPE_Q4_0);
         const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
@@ -338,6 +343,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
         const size_t num_active_segments = active_segments.size();
         std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs(num_active_segments);
+        std::vector<rknn_matmul_io_attr> segments_io_attrs(num_active_segments);
         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_B_segments(num_active_segments);
         std::shared_ptr<rknn_tensor_mem> mem_A_shared;
         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments(num_active_segments);
@@ -348,8 +354,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         {
             for (size_t i = 0; i < num_active_segments; ++i) {
                 const auto& seg = active_segments[i];
-                matmul_ctxs[i] = backend_ctx->get_matmul_ctx(M, K_op, seg.size_n, seg.core_id, matmul_type);
+                matmul_ctxs[i] = backend_ctx->get_matmul_ctx(M_op, K_op, seg.size_n, seg.core_id, matmul_type);
                 if (!matmul_ctxs[i] || matmul_ctxs[i]->ctx == 0) return GGML_STATUS_FAILED;
+                segments_io_attrs[i] = matmul_ctxs[i]->io_attr;
             }
         }
 
@@ -371,7 +378,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 for (size_t i = 0; i < num_active_segments; ++i) {
                     if (active_segments[i].offset_n == seg.offset_n) {
                         auto& matmul_ctx = matmul_ctxs[i];
-                        size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
+                        size_t segment_size_bytes = segments_io_attrs[i].B.size;
                         size_t total_offset = src0_base_offset_in_dma + current_offset_in_tensor;
                         
                         auto cache_key = std::make_pair(src0_buffer, total_offset);
@@ -387,7 +394,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                             mem_B_segments[i] = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
                             backend_ctx->b_mem_handle_cache[cache_key] = mem_B_segments[i];
                         }
-                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B_segments[i].get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_B_segments[i].get(), &segments_io_attrs[i].B), "set_io_mem B segment");
                         break;
                     }
                 }
@@ -398,33 +405,43 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         // ===========================================
         // ========== 3. Preparing A-matrix ==========
         // ===========================================
-        std::vector<float> scales_A(M);
+        // Use a fixed-size stack array for scales_A to avoid dynamic allocation
+        float scales_A[2048];
+        if (M_op > 2048) {
+            // Fallback to CPU if batch size is too large for stack buffer
+            return GGML_STATUS_FAILED;
+        }
+        memset(scales_A, 0, M_op * sizeof(float));
+
         float scale_B = 1.0f;
         {
-            auto cache_key = std::make_tuple(M, K, (int)w_type);
+            auto cache_key = std::make_tuple(M_op, K, (int)w_type);
             auto& matmul_ctx_0 = matmul_ctxs[0];
 
-            mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0->ctx, matmul_ctx_0->io_attr.A.size, cache_key, backend_ctx->a_buffer_cache);
+            mem_A_shared = get_or_create_npu_buffer(backend_ctx, matmul_ctx_0->ctx, segments_io_attrs[0].A.size, cache_key, backend_ctx->a_buffer_cache);
             if (!mem_A_shared) return GGML_STATUS_FAILED;
 
             // Sync src1 to CPU if it's coming from RKNPU
             const void* src1_data = ggml_rknpu_get_system_ptr(src1);
             // No need to sync FROM device if src1 was produced on CPU (which is usually the case in llama.cpp)
 
-            const int row_stride = (int)(src1->nb[1] / ggml_element_size(src1));
             void* dst_base = mem_A_shared->virt_addr;
 
             switch (op_support->npu_type_a) {
                 case rknpu2_configuration::NPU_TYPE_FP16: {
                     uint16_t* dst_ptr = (uint16_t*)dst_base;
                     #pragma omp parallel for
-                    for (int m = 0; m < M; ++m) {
-                        const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
+                    for (int m = 0; m < M_op; ++m) {
                         uint16_t* dst_row = dst_ptr + (size_t)m * K;
-                        if (src1->type == GGML_TYPE_F32) {
-                            rknpu2_quantization::convert_fp32_to_fp16((const float*)src_row, dst_row, K);
-                        } else if (src1->type == GGML_TYPE_F16) {
-                            memcpy(dst_row, src_row, K * sizeof(uint16_t));
+                        if (m < M) {
+                            const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
+                            if (src1->type == GGML_TYPE_F32) {
+                                rknpu2_quantization::convert_fp32_to_fp16((const float*)src_row, dst_row, K);
+                            } else if (src1->type == GGML_TYPE_F16) {
+                                memcpy(dst_row, src_row, K * sizeof(uint16_t));
+                            }
+                        } else {
+                            memset(dst_row, 0, K * sizeof(uint16_t));
                         }
                     }
                     break;
@@ -433,20 +450,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 case rknpu2_configuration::NPU_TYPE_INT8: {
                     int8_t* dst_ptr = (int8_t*)dst_base;
                     #pragma omp parallel for
-                    for (int m = 0; m < M; ++m) {
-                        const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
-                        if (src1->type == GGML_TYPE_F32) {
-                            const float* f32_row = (const float*)src_row;
-                            float amax_m = rknpu2_quantization::calculate_amax_fp32(f32_row, K);
-                            scales_A[m] = amax_m / 127.0f;
-                            int8_t* dst_row = dst_ptr + (size_t)m * K;
-                            rknpu2_quantization::quantize_fp32_to_int8(f32_row, dst_row, K, scales_A[m]);
-                        } else if (src1->type == GGML_TYPE_F16) {
-                            const uint16_t* f16_row = (const uint16_t*)src_row;
-                            float amax_m = rknpu2_quantization::calculate_amax_fp16(f16_row, K);
-                            scales_A[m] = amax_m / 127.0f;
-                            int8_t* dst_row = dst_ptr + (size_t)m * K;
-                            rknpu2_quantization::quantize_fp16_to_int8(f16_row, dst_row, K, scales_A[m]);
+                    for (int m = 0; m < M_op; ++m) {
+                        int8_t* dst_row = dst_ptr + (size_t)m * K;
+                        if (m < M) {
+                            const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
+                            if (src1->type == GGML_TYPE_F32) {
+                                const float* f32_row = (const float*)src_row;
+                                float amax_m = rknpu2_quantization::calculate_amax_fp32(f32_row, K);
+                                scales_A[m] = amax_m / 127.0f;
+                                rknpu2_quantization::quantize_fp32_to_int8(f32_row, dst_row, K, scales_A[m]);
+                            } else if (src1->type == GGML_TYPE_F16) {
+                                const uint16_t* f16_row = (const uint16_t*)src_row;
+                                float amax_m = rknpu2_quantization::calculate_amax_fp16(f16_row, K);
+                                scales_A[m] = amax_m / 127.0f;
+                                rknpu2_quantization::quantize_fp16_to_int8(f16_row, dst_row, K, scales_A[m]);
+                            }
+                        } else {
+                            memset(dst_row, 0, K);
+                            scales_A[m] = 0.0f;
                         }
                     }
                     break;
@@ -467,26 +488,31 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
 
                     uint8_t* dst_ptr = (uint8_t*)dst_base;
                     #pragma omp parallel for
-                    for (int m = 0; m < M; ++m) {
-                        const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
-                        std::vector<float> f32_row(K);
-                        if (src1->type == GGML_TYPE_F32) {
-                            memcpy(f32_row.data(), src_row, K * sizeof(float));
-                        } else if (src1->type == GGML_TYPE_F16) {
-                            rknpu2_quantization::convert_fp16_to_fp32((const uint16_t*)src_row, f32_row.data(), K);
-                        }
-                        
-                        std::vector<float> signed_row(K);
-                        for(int k=0; k<K; ++k) signed_row[k] = f32_row[k] * s_vec[k];
-
-                        std::vector<float> rotated_row(K_op);
-                        rknpu2_calibration::hadamard_transform(rotated_row.data(), signed_row.data(), K, K_op);
-
-                        float amax_m = 0.0f;
-                        for (int k = 0; k < K_op; ++k) amax_m = std::max(amax_m, std::abs(rotated_row[k]));
-                        scales_A[m] = amax_m / 7.0f;
+                    for (int m = 0; m < M_op; ++m) {
                         uint8_t* dst_row = dst_ptr + (size_t)m * (K_op / 2);
-                        rknpu2_quantization::quantize_fp32_to_int4_packed(rotated_row.data(), dst_row, K_op, scales_A[m]);
+                        if (m < M) {
+                            const void* src_row = (const uint8_t*)src1_data + (size_t)m * src1->nb[1];
+                            std::vector<float> f32_row(K);
+                            if (src1->type == GGML_TYPE_F32) {
+                                memcpy(f32_row.data(), src_row, K * sizeof(float));
+                            } else if (src1->type == GGML_TYPE_F16) {
+                                rknpu2_quantization::convert_fp16_to_fp32((const uint16_t*)src_row, f32_row.data(), K);
+                            }
+                            
+                            std::vector<float> signed_row(K);
+                            for(int k=0; k<K; ++k) signed_row[k] = f32_row[k] * s_vec[k];
+
+                            std::vector<float> rotated_row(K_op);
+                            rknpu2_calibration::hadamard_transform(rotated_row.data(), signed_row.data(), K, K_op);
+
+                            float amax_m = 0.0f;
+                            for (int k = 0; k < K_op; ++k) amax_m = std::max(amax_m, std::abs(rotated_row[k]));
+                            scales_A[m] = amax_m / 7.0f;
+                            rknpu2_quantization::quantize_fp32_to_int4_packed(rotated_row.data(), dst_row, K_op, scales_A[m]);
+                        } else {
+                            memset(dst_row, 0, K_op / 2);
+                            scales_A[m] = 0.0f;
+                        }
                     }
                     break;
                 }
@@ -517,10 +543,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         {            
             for (size_t i = 0; i < num_active_segments; i++) {
                 auto& matmul_ctx = matmul_ctxs[i];
-                auto cache_key = std::make_tuple(M, active_segments[i].size_n, active_segments[i].core_id);
-                mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                auto cache_key = std::make_tuple(M_op, active_segments[i].size_n, active_segments[i].core_id);
+                mem_C_segments[i] = get_or_create_npu_buffer(backend_ctx, matmul_ctx->ctx, segments_io_attrs[i].C.size, cache_key, backend_ctx->c_buffer_cache);
                 if (!mem_C_segments[i]) return GGML_STATUS_FAILED;
-                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[i].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
+                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[i].get(), &segments_io_attrs[i].C), "set_io_mem C");
             }
         }
 
@@ -533,7 +559,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
 
             for (size_t i = 0; i < num_active_segments; i++) {
-                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[i]->ctx, mem_A_shared.get(), &matmul_ctxs[i]->io_attr.A), "set_io_mem A for core");
+                RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[i]->ctx, mem_A_shared.get(), &segments_io_attrs[i].A), "set_io_mem A for core");
             }
 
             #pragma omp parallel for num_threads(num_active_segments)
@@ -543,7 +569,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     #pragma omp critical
                     {
                         run_ret = ret;
-                        printf("RKNPU2: Failed to run matmul for node %s segment %zu core %d error %d! M=%d K=%d N=%d\n", node->name, i, active_segments[i].core_id, ret, M, K_op, active_segments[i].size_n);
+                        printf("RKNPU2: Failed to run matmul for node %s segment %zu core %d error %d! M=%d K=%d N=%d\n", node->name, i, active_segments[i].core_id, ret, M_op, K_op, active_segments[i].size_n);
                     }
                 }
             }
@@ -560,54 +586,49 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                 RKNN_CHECK(rknn_mem_sync(matmul_ctxs[i]->ctx, mem_C_segments[i].get(), RKNN_MEMORY_SYNC_FROM_DEVICE), "sync C FROM_DEVICE");
             }
 
-            #pragma omp parallel for
+            #pragma omp parallel for collapse(2)
             for (int m = 0; m < M; m++) {
-                switch (op_support->npu_type_c) {
-                    case rknpu2_configuration::NPU_TYPE_FP32: {
-                        for (size_t i = 0; i < num_active_segments; i++) {
+                for (size_t i = 0; i < num_active_segments; i++) {
+                    switch (op_support->npu_type_c) {
+                        case rknpu2_configuration::NPU_TYPE_FP32: {
                             int N_offset = active_segments[i].offset_n;
                             int N_segment = active_segments[i].size_n;
                             float* src_segment_base = (float*)mem_C_segments[i]->virt_addr;
                             memcpy(dst_data + (size_t)m * N + N_offset,
                                 src_segment_base + (size_t)m * N_segment,
                                 N_segment * sizeof(float));
+                            break;
                         }
-                        break;
-                    }
 
-                    case rknpu2_configuration::NPU_TYPE_INT32: {
-                        float dequant_scale = scales_A[m] * scale_B;
-                        for (size_t i = 0; i < num_active_segments; i++) {
+                        case rknpu2_configuration::NPU_TYPE_INT32: {
+                            float dequant_scale = scales_A[m] * scale_B;
                             int N_offset = active_segments[i].offset_n;
                             int N_segment = active_segments[i].size_n;
                             float* dst_ptr = dst_data + (size_t)m * N + N_offset;
                             int32_t* src_segment_base = (int32_t*)mem_C_segments[i]->virt_addr;
                             int32_t* src_ptr = src_segment_base + (size_t)m * N_segment;
                             rknpu2_quantization::dequantize_int32_to_fp32(src_ptr, dst_ptr, N_segment, dequant_scale);
-                        }
-                        break;
-                    }
-
-                    case rknpu2_configuration::NPU_TYPE_INT16: {
-                        float dequant_scale = scales_A[m] * scale_B;
-                        if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
-                            dequant_scale /= (float)K_op;
+                            break;
                         }
 
-                        for (size_t i = 0; i < num_active_segments; i++) {
+                        case rknpu2_configuration::NPU_TYPE_INT16: {
+                            float dequant_scale = scales_A[m] * scale_B;
+                            if (op_support->npu_type_a == rknpu2_configuration::NPU_TYPE_INT4) {
+                                dequant_scale /= (float)K_op;
+                            }
+
                             int N_offset = active_segments[i].offset_n;
                             int N_segment = active_segments[i].size_n;
                             float* dst_ptr = dst_data + (size_t)m * N + N_offset;
                             int16_t* src_segment_base = (int16_t*)mem_C_segments[i]->virt_addr;
                             int16_t* src_ptr = src_segment_base + (size_t)m * N_segment;
                             rknpu2_quantization::dequantize_int16_to_fp32(src_ptr, dst_ptr, N_segment, dequant_scale);
+                            break;
                         }
-                        break;
+                        
+                        default:
+                            break;
                     }
-                    
-                    default:
-                        // This should not be reached if config is correct
-                        break;
                 }
             }
         }
@@ -1024,6 +1045,9 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             }
 
             // Removed CPU fallback for batched matmuls (M > 1) to enable RKNPU offloading
+            // if (src1->ne[1] > 1) {
+            //     return false;
+            // }
 
             // Checking contiguous memory
             if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {

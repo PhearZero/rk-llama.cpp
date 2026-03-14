@@ -124,7 +124,7 @@ Rknpu2ConfigManager::Rknpu2ConfigManager() {
     // --- Define RK3588 Configuration ---
     Rknpu2DeviceConfig rk3588_config;
     rk3588_config.device_name = "RK3588";
-    rk3588_config.core_count = 1;
+    rk3588_config.core_count = 3;
     rk3588_config.supported_ops = {
         {
             /* .type_w    = */ GGML_TYPE_F16,               // Weights must be converted from F16
