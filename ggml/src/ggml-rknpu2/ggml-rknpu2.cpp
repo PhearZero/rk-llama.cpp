@@ -338,6 +338,13 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     // Check if buffer is RKNPU
     const char * name = ggml_backend_buffer_name(tensor->buffer);
     if (strcmp(name, "RKNPU") != 0) return;
+
+    // Optimization: for leaf tensors (written by CPU via set_tensor), 
+    // we don't need RKNN_MEMORY_SYNC_FROM_DEVICE because they are already in RAM/CPU cache.
+    // In fact, invalidating the cache here might cause us to read stale/garbage data from NPU side.
+    if (type == RKNN_MEMORY_SYNC_FROM_DEVICE && tensor->op == GGML_OP_NONE && tensor->view_src == NULL) {
+        return;
+    }
     
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)tensor->buffer->context;
     if (!ctx->dma_buf.virt_addr) return;
@@ -348,15 +355,15 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     rknn_tensor_mem sync_mem = {};
     sync_mem.virt_addr = (void*)((uint8_t*)ctx->dma_buf.virt_addr + total_offset);
     sync_mem.fd = ctx->dma_buf.fd;
-    sync_mem.offset = (uint32_t)total_offset;
+    sync_mem.offset = 0; // Use virt_addr with offset, set structure offset to 0
     sync_mem.size = (uint32_t)size;
     
     auto mem_ctx = get_rknpu_memory_context().get_ctx();
     if (mem_ctx != 0) {
         int ret = rknn_mem_sync(mem_ctx, &sync_mem, type);
         if (ret != 0) {
-            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, offset=%zu, size=%zu\n",
-                ret, tensor->name, (int)type, total_offset, size);
+            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, virt_addr=%p, size=%zu\n",
+                ret, tensor->name, (int)type, sync_mem.virt_addr, size);
             fflush(stdout);
         }
     }
@@ -484,6 +491,10 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
         if (i01 < 0 || i01 >= ne01) {
             printf("RKNPU2: get_rows index OUT OF BOUNDS: i=%ld, i01=%ld, ne01=%ld, src1_type=%d, src1_name=%s, src0_name=%s\n",
                    i, i01, ne01, src1->type, src1->name, src0->name);
+            if (i == 0 && src1->data) {
+                const int32_t * p = (const int32_t *)src1->data;
+                printf("RKNPU2: get_rows src1[0..3] = [ %d, %d, %d, %d ]\n", p[0], p[1], p[2], p[3]);
+            }
             fflush(stdout);
         }
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
@@ -1089,8 +1100,20 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
-    UNUSED(buffer);
-    UNUSED(tensor);
+    if (!buffer || !buffer->context || !tensor) return GGML_STATUS_FAILED;
+    
+    // If tensor already has data (e.g. from RPC deserialization), don't overwrite it
+    // unless it looks like an offset (i.e. very small value)
+    if (tensor->data != NULL && (uintptr_t)tensor->data > 0x1000000) {
+        return GGML_STATUS_SUCCESS;
+    }
+    
+    ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
+    if (ctx->dma_buf.virt_addr) {
+        uintptr_t offset = (uintptr_t)tensor->data;
+        tensor->data = (uint8_t*)ctx->dma_buf.virt_addr + offset;
+    }
+    
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1243,11 +1266,11 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
         rknn_tensor_mem sync_mem = {};
         sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
         sync_mem.fd = ctx->dma_buf.fd;
-        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
+        sync_mem.offset = 0; // Use virt_addr with offset
         sync_mem.size = (uint32_t)size;
         auto mem_ctx = get_rknpu_memory_context().get_ctx();
         if (mem_ctx != 0) {
-            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, offset=%u, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.offset, sync_mem.size);
+            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, virt_addr=%p, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.virt_addr, sync_mem.size);
             fflush(stdout);
             int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
             if (ret != 0) {
@@ -1296,7 +1319,7 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
         rknn_tensor_mem sync_mem = {};
         sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
         sync_mem.fd = ctx->dma_buf.fd;
-        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
+        sync_mem.offset = 0; // Use virt_addr with offset
         sync_mem.size = (uint32_t)size;
         auto mem_ctx = get_rknpu_memory_context().get_ctx();
         if (mem_ctx != 0) {
