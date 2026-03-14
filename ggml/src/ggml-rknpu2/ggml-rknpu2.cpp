@@ -329,6 +329,167 @@ static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer,
     return (uint8_t*)tensor->data - (uint8_t*)base_addr;
 }
 
+
+static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_type type, size_t offset, size_t size) {
+    if (!tensor || !tensor->data || !tensor->buffer || !tensor->buffer->context) return;
+    
+    // Check if buffer is RKNPU
+    const char * name = ggml_backend_buffer_name(tensor->buffer);
+    if (strcmp(name, "RKNPU") != 0) return;
+    
+    ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)tensor->buffer->context;
+    if (!ctx->dma_buf.virt_addr) return;
+    
+    rknn_tensor_mem sync_mem = {};
+    sync_mem.virt_addr = (void*)((uint8_t*)tensor->data + offset);
+    sync_mem.fd = ctx->dma_buf.fd;
+    sync_mem.size = (uint32_t)size;
+    
+    auto mem_ctx = get_rknpu_memory_context().get_ctx();
+    if (mem_ctx != 0) {
+        rknn_mem_sync(mem_ctx, &sync_mem, type);
+    }
+}
+
+static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0]; // new rows
+    const struct ggml_tensor * src1 = dst->src[1]; // indices
+    const struct ggml_tensor * src2 = dst->src[2]; // cache
+
+    rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
+    rknpu_sync_tensor(src1, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src1));
+    rknpu_sync_tensor(src2, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src2));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
+
+    const size_t nb10 = src1->nb[0];
+    const size_t nb11 = src1->nb[1];
+    const size_t nb12 = src1->nb[2];
+
+    const int64_t ne1 = dst->ne[1];
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+    const size_t nb3 = dst->nb[3];
+
+    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = 0; i < ne01; ++i) {
+                const int64_t i12 = i03 % src1->ne[2];
+                const int64_t i11 = i02 % src1->ne[1];
+                const int64_t i10 = i;
+
+                int64_t i1;
+                if (src1->type == GGML_TYPE_I32) {
+                    i1 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                } else {
+                    i1 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+                }
+
+                GGML_ASSERT(i1 >= 0 && i1 < ne1);
+
+                from_float(
+                        (const float *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03),
+                                        ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), ne00);
+            }
+        }
+    }
+
+    rknpu_sync_tensor(dst, RKNN_MEMORY_SYNC_TO_DEVICE, 0, ggml_nbytes(dst));
+}
+
+static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
+    rknpu_sync_tensor(src1, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src1));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
+
+    const size_t nb10 = src1->nb[0];
+    const size_t nb11 = src1->nb[1];
+    const size_t nb12 = src1->nb[2];
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+    const size_t nb3 = dst->nb[3];
+
+    ggml_to_float_t   const to_float   = ggml_get_type_traits(src0->type)->to_float;
+    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+
+    std::vector<float> row_f32(ne00);
+    for (int64_t i = 0; i < ggml_nelements(src1); ++i) {
+        const int64_t i12 = i / (ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10) / ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+
+        int64_t i01;
+        if (src1->type == GGML_TYPE_I32) {
+            i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        } else {
+            i01 = *(int64_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+        }
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        to_float((const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03), row_f32.data(), ne00);
+        from_float(row_f32.data(), (void *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), ne00);
+    }
+
+    rknpu_sync_tensor(dst, RKNN_MEMORY_SYNC_TO_DEVICE, 0, ggml_nbytes(dst));
+}
+
+static void rknpu_compute_forward_cpy(struct ggml_tensor * dst) {
+    const struct ggml_tensor * src0 = dst->src[0];
+
+    rknpu_sync_tensor(src0, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src0));
+    rknpu_sync_tensor(dst, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(dst));
+
+    const int64_t ne00 = src0->ne[0];
+    const int64_t ne01 = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+
+    const size_t nb01 = src0->nb[1];
+    const size_t nb02 = src0->nb[2];
+    const size_t nb03 = src0->nb[3];
+
+    const size_t nb1 = dst->nb[1];
+    const size_t nb2 = dst->nb[2];
+    const size_t nb3 = dst->nb[3];
+
+    ggml_to_float_t   const to_float   = ggml_get_type_traits(src0->type)->to_float;
+    ggml_from_float_t const from_float = ggml_get_type_traits(dst->type)->from_float;
+
+    std::vector<float> row_f32(ne00);
+    for (int64_t i03 = 0; i03 < ne03; i03++) {
+        for (int64_t i02 = 0; i02 < ne02; i02++) {
+            for (int64_t i01 = 0; i01 < ne01; i01++) {
+                to_float((char *)src0->data + i01*nb01 + i02*nb02 + i03*nb03, row_f32.data(), ne00);
+                from_float(row_f32.data(), (char *)dst->data + i01*nb1 + i02*nb2 + i03*nb3, ne00);
+            }
+        }
+    }
+
+    rknpu_sync_tensor(dst, RKNN_MEMORY_SYNC_TO_DEVICE, 0, ggml_nbytes(dst));
+}
+
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     printf("RKNPU2: graph_compute n_nodes=%d\n", cgraph->n_nodes);
     fflush(stdout);
@@ -343,8 +504,25 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         
         printf("RKNPU2: node[%d]: op=%s, name=%s\n", i, ggml_op_name(node->op), node->name);
         fflush(stdout);
-        
-        if (node->op != GGML_OP_MUL_MAT) continue;
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            // ... MUL_MAT implementation follows ...
+        } else if (node->op == GGML_OP_SET_ROWS) {
+            rknpu_compute_forward_set_rows(node);
+            continue;
+        } else if (node->op == GGML_OP_GET_ROWS) {
+            rknpu_compute_forward_get_rows(node);
+            continue;
+        } else if (node->op == GGML_OP_CPY || node->op == GGML_OP_DUP || node->op == GGML_OP_CONT) {
+            rknpu_compute_forward_cpy(node);
+            continue;
+        } else if (ggml_op_is_empty(node->op)) {
+            continue;
+        } else {
+            // Check if we should ignore or fail
+            if (node->op == GGML_OP_NONE) continue;
+            continue; // Skip unknown nodes for now, hopefully supports_op caught them
+        }
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
         const struct ggml_tensor* src1 = node->src[1]; // Activations  :  (M x K)
@@ -1064,6 +1242,18 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
            tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
     fflush(stdout);
 
+    // Sync from NPU before reading with CPU
+    if (size > 0) {
+        rknn_tensor_mem sync_mem = {};
+        sync_mem.virt_addr = (void*)(tensor_dma_ptr + offset);
+        sync_mem.fd = ctx->dma_buf.fd;
+        sync_mem.size = (uint32_t)size;
+        auto mem_ctx = get_rknpu_memory_context().get_ctx();
+        if (mem_ctx != 0) {
+            rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
+        }
+    }
+
     memcpy(data, tensor_dma_ptr + offset, size);
 }
 
@@ -1225,6 +1415,17 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
 
     switch (op->op) {
         case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_CONT:
             return true;
 
         case GGML_OP_MUL_MAT: {
