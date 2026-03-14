@@ -76,6 +76,11 @@ DmaBuffer alloc(size_t size) {
         close(buffer.fd);
         buffer.fd = -1;
         buffer.virt_addr = nullptr;
+    } else {
+        // Zero-initialize the buffer to prevent stale garbage data
+        printf("RKNPU_DMA_ALLOC: Zeroing buffer of size %zu...\n", size);
+        fflush(stdout);
+        memset(buffer.virt_addr, 0, size);
     }
 
     return buffer;

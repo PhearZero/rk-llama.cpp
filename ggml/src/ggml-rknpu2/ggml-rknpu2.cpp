@@ -345,18 +345,35 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     size_t tensor_offset = ggml_backend_rknpu_get_tensor_offset(tensor->buffer, tensor);
     size_t total_offset = tensor_offset + offset;
 
+    if (type == RKNN_MEMORY_SYNC_FROM_DEVICE) {
+        // Optimization: If the tensor is a leaf (not produced by NPU) and not a view,
+        // it's likely only written by CPU. Syncing FROM_DEVICE might clobber CPU cache 
+        // with stale RAM data if the previous TO_DEVICE sync was incomplete or buggy.
+        if (tensor->view_src == NULL && tensor->op == GGML_OP_NONE) {
+            return;
+        }
+    }
+
+    // Use combined address to avoid driver offset bugs or 32-bit truncation
     rknn_tensor_mem sync_mem = {};
-    sync_mem.virt_addr = ctx->dma_buf.virt_addr;
+    sync_mem.virt_addr = (uint8_t*)ctx->dma_buf.virt_addr + total_offset;
     sync_mem.fd = ctx->dma_buf.fd;
-    sync_mem.offset = (uint32_t)total_offset;
+    sync_mem.offset = 0;
     sync_mem.size = (uint32_t)size;
     
     auto mem_ctx = get_rknpu_memory_context().get_ctx();
     if (mem_ctx != 0) {
+        // Memory barrier before sync
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        
         int ret = rknn_mem_sync(mem_ctx, &sync_mem, type);
+        
+        // Memory barrier after sync
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
         if (ret != 0) {
-            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, fd=%d, offset=%u, size=%u\n",
-                ret, tensor->name, (int)type, sync_mem.fd, sync_mem.offset, sync_mem.size);
+            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, fd=%d, addr=%p, size=%u\n",
+                ret, tensor->name, (int)type, sync_mem.fd, sync_mem.virt_addr, sync_mem.size);
             fflush(stdout);
         }
     }
@@ -494,13 +511,23 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
             printf("RKNPU2: get_rows index OUT OF BOUNDS: i=%ld, i01=%ld, ne01=%ld, src1_type=%d, src1_name=%s, src0_name=%s\n",
                    i, i01, ne01, src1->type, src1->name, src0->name);
             if (i == 0 && src1->data) {
-                const int32_t * p = (const int32_t *)src1->data;
-                int n_dump = std::min((int64_t)4, ggml_nelements(src1));
-                printf("RKNPU2: get_rows src1[0..%d] = [", n_dump - 1);
+                const uint8_t * p = (const uint8_t *)src1->data;
+                int n_dump = std::min((int64_t)16, ggml_nbytes(src1));
+                printf("RKNPU2: get_rows src1[0..%d] (raw hex) = [", n_dump - 1);
                 for (int j = 0; j < n_dump; ++j) {
-                    printf(" %d%s", p[j], (j < n_dump - 1 ? "," : ""));
+                    printf(" %02x%s", p[j], (j < n_dump - 1 ? "," : ""));
                 }
                 printf(" ]\n");
+                
+                if (src1->type == GGML_TYPE_I32) {
+                    const int32_t * pi = (const int32_t *)src1->data;
+                    int ni_dump = std::min((int64_t)4, ggml_nelements(src1));
+                    printf("RKNPU2: get_rows src1[0..%d] (int32) = [", ni_dump - 1);
+                    for (int j = 0; j < ni_dump; ++j) {
+                        printf(" %d%s", pi[j], (j < ni_dump - 1 ? "," : ""));
+                    }
+                    printf(" ]\n");
+                }
             }
             fflush(stdout);
         }
@@ -876,6 +903,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             if (!mem_A_shared) return GGML_STATUS_FAILED;
 
             // Sync src1 to CPU if it's coming from RKNPU
+            rknpu_sync_tensor(src1, RKNN_MEMORY_SYNC_FROM_DEVICE, 0, ggml_nbytes(src1));
             const void* src1_data = ggml_rknpu_get_system_ptr(src1);
             // No need to sync FROM device if src1 was produced on CPU (which is usually the case in llama.cpp)
 
@@ -1109,16 +1137,16 @@ static void * ggml_backend_rknpu_buffer_get_base(ggml_backend_buffer_t buffer) {
 static enum ggml_status ggml_backend_rknpu_buffer_init_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor) {
     if (!buffer || !buffer->context || !tensor) return GGML_STATUS_FAILED;
     
-    // If tensor already has data (e.g. from RPC deserialization), don't overwrite it
-    // unless it looks like an offset (i.e. very small value)
-    if (tensor->data != NULL && (uintptr_t)tensor->data > 0x1000000) {
-        return GGML_STATUS_SUCCESS;
-    }
-    
     ggml_backend_rknpu_buffer_context * ctx = (ggml_backend_rknpu_buffer_context *)buffer->context;
     if (ctx->dma_buf.virt_addr) {
-        uintptr_t offset = (uintptr_t)tensor->data;
-        tensor->data = (uint8_t*)ctx->dma_buf.virt_addr + offset;
+        uintptr_t data_val = (uintptr_t)tensor->data;
+        uintptr_t base_val = (uintptr_t)ctx->dma_buf.virt_addr;
+        uintptr_t end_val = base_val + ctx->dma_buf.size;
+        
+        // If data is NOT within the buffer range, treat it as an offset and add base
+        if (data_val < base_val || data_val >= end_val) {
+            tensor->data = (uint8_t*)ctx->dma_buf.virt_addr + data_val;
+        }
     }
     
     return GGML_STATUS_SUCCESS;
@@ -1270,24 +1298,7 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     // Syncing the raw data to the NPU
     if (size > 0) {
-        rknn_tensor_mem sync_mem = {};
-        sync_mem.virt_addr = ctx->dma_buf.virt_addr;
-        sync_mem.fd = ctx->dma_buf.fd;
-        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
-        sync_mem.size = (uint32_t)size;
-        auto mem_ctx = get_rknpu_memory_context().get_ctx();
-        if (mem_ctx != 0) {
-            printf("RKNPU2: set_tensor calling rknn_mem_sync ctx=%p, fd=%d, offset=%u, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.offset, sync_mem.size);
-            fflush(stdout);
-            int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_TO_DEVICE);
-            if (ret != 0) {
-                printf("RKNPU2: rknn_mem_sync FAILED, ret=%d\n", ret);
-                fflush(stdout);
-            } else {
-                printf("RKNPU2: set_tensor rknn_mem_sync SUCCESS\n");
-                fflush(stdout);
-            }
-        }
+        rknpu_sync_tensor(tensor, RKNN_MEMORY_SYNC_TO_DEVICE, offset, size);
     }
 }
 
@@ -1323,21 +1334,7 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t buffer, c
 
     // Sync from NPU before reading with CPU
     if (size > 0) {
-        rknn_tensor_mem sync_mem = {};
-        sync_mem.virt_addr = ctx->dma_buf.virt_addr;
-        sync_mem.fd = ctx->dma_buf.fd;
-        sync_mem.offset = (uint32_t)(tensor_offset_in_buffer + offset);
-        sync_mem.size = (uint32_t)size;
-        auto mem_ctx = get_rknpu_memory_context().get_ctx();
-        if (mem_ctx != 0) {
-            printf("RKNPU2: get_tensor calling rknn_mem_sync ctx=%p, fd=%d, offset=%u, size=%u\n", (void*)mem_ctx, sync_mem.fd, sync_mem.offset, sync_mem.size);
-            fflush(stdout);
-            int ret = rknn_mem_sync(mem_ctx, &sync_mem, RKNN_MEMORY_SYNC_FROM_DEVICE);
-            if (ret != 0) {
-                printf("RKNPU2: get_tensor rknn_mem_sync FAILED, ret=%d\n", ret);
-                fflush(stdout);
-            }
-        }
+        rknpu_sync_tensor(tensor, RKNN_MEMORY_SYNC_FROM_DEVICE, offset, size);
     }
 
     memcpy(data, tensor_dma_ptr + offset, size);
