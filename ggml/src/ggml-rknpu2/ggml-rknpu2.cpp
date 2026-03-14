@@ -1238,6 +1238,7 @@ static bool ggml_backend_rknpu_device_supports_op(ggml_backend_dev_t dev, const 
             return true;
 
         case GGML_OP_MUL_MAT: {
+            return false; // TEMPORARILY DISABLE ALL MUL_MAT ON NPU
             const struct ggml_tensor * src0 = op->src[0]; // Weights
             const struct ggml_tensor * src1 = op->src[1]; // Activations
 
