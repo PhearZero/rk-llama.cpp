@@ -189,6 +189,8 @@ struct rknpu_matmul_context {
     rknn_matmul_ctx ctx = 0;
 
     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type) {
+        printf("RKNPU2: Calling rknn_matmul_create M=%d, K=%d, N=%d, type=%d...\n", M, K, N, (int)type);
+        fflush(stdout);
         memset(&info, 0, sizeof(info));
         info.M = M;
         info.K = K;
@@ -200,7 +202,11 @@ struct rknpu_matmul_context {
         int ret = rknn_matmul_create(&ctx, &info, &io_attr);
         if (ret < 0) {
             printf("RKNPU2: Failed to create matmul context! M=%d, K=%d, N=%d, type=%d, error=%d\n", M, K, N, (int)type, ret);
+            fflush(stdout);
             ctx = 0;
+        } else {
+            printf("RKNPU2: SUCCESS rknn_matmul_create ctx=%p\n", (void*)ctx);
+            fflush(stdout);
         }
     }
 
@@ -323,6 +329,8 @@ static size_t ggml_backend_rknpu_get_tensor_offset(ggml_backend_buffer_t buffer,
 }
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
+    printf("RKNPU2: graph_compute n_nodes=%d\n", cgraph->n_nodes);
+    fflush(stdout);
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
     // Getting the current device configuration once
@@ -331,6 +339,10 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor* node = cgraph->nodes[i];
         if (!node) continue;
+        
+        printf("RKNPU2: node[%d]: op=%s, name=%s\n", i, ggml_op_name(node->op), node->name);
+        fflush(stdout);
+        
         if (node->op != GGML_OP_MUL_MAT) continue;
 
         const struct ggml_tensor* src0 = node->src[0]; // Weights      :  (K x N)
@@ -355,6 +367,36 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         const int K_op = is_q4_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
 
         const auto* op_support = config.find_op_support(src0->type);
+        if (!op_support) {
+            printf("RKNPU2: node %s has unsupported weight type %s\n", node->name, ggml_type_name(src0->type));
+            fflush(stdout);
+            return GGML_STATUS_FAILED;
+        }
+
+        if (src1->type != op_support->type_a) {
+            printf("RKNPU2: node %s has unsupported activation type %s (expected %s)\n", node->name, ggml_type_name(src1->type), ggml_type_name(op_support->type_a));
+            fflush(stdout);
+            return GGML_STATUS_FAILED;
+        }
+
+        if (src0->ne[0] % op_support->k_align != 0) {
+            printf("RKNPU2: node %s has unaligned K=%d (alignment required: %d)\n", node->name, (int)src0->ne[0], op_support->k_align);
+            fflush(stdout);
+            return GGML_STATUS_FAILED;
+        }
+
+        if (src0->ne[1] % op_support->n_align != 0) {
+            printf("RKNPU2: node %s has unaligned N=%d (alignment required: %d)\n", node->name, (int)src0->ne[1], op_support->n_align);
+            fflush(stdout);
+            return GGML_STATUS_FAILED;
+        }
+
+        if (src1->ne[0] != src0->ne[0]) {
+            printf("RKNPU2: node %s has mismatched K: src0 K=%d, src1 K=%d\n", node->name, (int)src0->ne[0], (int)src1->ne[0]);
+            fflush(stdout);
+            return GGML_STATUS_FAILED;
+        }
+
         const rknn_matmul_type matmul_type = op_support->mm_type;
         const int alignment = op_support->n_align;
 
@@ -417,11 +459,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
                     // Find the IO attr for this segment to get the required packed size
                     // We can use any matmul_ctx that has the same K_op and segment size
                     auto temp_matmul_ctx = backend_ctx->get_matmul_ctx(M_op, K_op, seg.size_n, seg.core_id, matmul_type);
+                    if (!temp_matmul_ctx) {
+                        printf("RKNPU2: Failed to get temporary matmul context for weight packing!\n");
+                        fflush(stdout);
+                        return GGML_STATUS_FAILED;
+                    }
                     total_packed_size += temp_matmul_ctx->io_attr.B.size;
                 }
 
-                // Allocate a new NPU buffer for the packed weights
-                rknn_tensor_mem* mem_ptr = rknn_create_mem(get_rknpu_memory_context().get_ctx(), total_packed_size);
+                auto mem_ctx = get_rknpu_memory_context().get_ctx();
+                if (mem_ctx == 0) {
+                    printf("RKNPU2: Failed to get global memory context for weight packing!\n");
+                    fflush(stdout);
+                    return GGML_STATUS_FAILED;
+                }
+                rknn_tensor_mem* mem_ptr = rknn_create_mem(mem_ctx, total_packed_size);
                 if (!mem_ptr) {
                     printf("RKNPU2: Failed to allocate packed weight buffer of size %zu\n", total_packed_size);
                     return GGML_STATUS_FAILED;

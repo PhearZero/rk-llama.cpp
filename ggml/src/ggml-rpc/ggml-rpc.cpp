@@ -1576,7 +1576,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph compute failed with status %d\n", __func__, (int)status);
+        return false;
+    }
     stored_graphs[device].ctx_ptr.swap(ctx_ptr);
     stored_graphs[device].graph = graph;
     return true;
@@ -1593,7 +1596,10 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     ggml_cgraph * graph = stored_graphs[device].graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (status != GGML_STATUS_SUCCESS) {
+        GGML_LOG_ERROR("[%s] graph recompute failed with status %d\n", __func__, (int)status);
+        return false;
+    }
     return true;
 }
 
@@ -1641,6 +1647,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
         if (!recv_data(sockfd, &cmd, 1)) {
             break;
         }
+        printf("RPC_SERVER: Received command %d\n", (int)cmd);
+        fflush(stdout);
         if (cmd >= RPC_CMD_COUNT) {
             // fail fast if the command is invalid
             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
@@ -1761,6 +1769,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
+                printf("RPC_SERVER: Handling RPC_CMD_SET_TENSOR\n");
+                fflush(stdout);
                 std::vector<uint8_t> input;
                 if (!recv_msg(sockfd, input)) {
                     return;
@@ -1831,6 +1841,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_GRAPH_COMPUTE: {
+                printf("RPC_SERVER: Handling RPC_CMD_GRAPH_COMPUTE\n");
+                fflush(stdout);
                 std::vector<uint8_t> input;
                 if (!recv_msg(sockfd, input)) {
                     return;
