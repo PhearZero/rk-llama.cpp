@@ -813,7 +813,8 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
 
     uint8_t* tensor_dma_ptr = dma_base + ((uintptr_t)tensor->data - (uintptr_t)ggml_backend_rknpu_buffer_get_base(buffer));
     
-    // printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p\n", tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data);
+    // printf("RKNPU2: set_tensor node=%s, type=%s, size=%zu, offset=%zu, tensor_data=%p, target=%p\n", 
+    //        tensor->name, ggml_type_name(tensor->type), size, offset, tensor->data, (void*)(tensor_dma_ptr + offset));
 
     // Getting the current device configuration to drive the packing logic
     const auto& config = rknpu2_configuration::Rknpu2ConfigManager::get_instance().get_current_config();
@@ -958,13 +959,16 @@ static ggml_backend_buffer_t ggml_backend_rknpu_buffer_type_alloc_buffer(ggml_ba
     printf("RKNPU2: alloc_buffer size=%zu\n", size);
 
     rknpu2_allocation::DmaBuffer dma_buf = rknpu2_allocation::alloc(size);
-    if (dma_buf.fd < 0) {
+    if (dma_buf.fd < 0 || !dma_buf.virt_addr) {
+        printf("RKNPU2: alloc_buffer FAILED size=%zu\n", size);
         return NULL;
     }
 
-    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context{
-        dma_buf, "rknpu_dma_buffer", {}, {}, {}, {}
-    };
+    ggml_backend_rknpu_buffer_context * ctx = new ggml_backend_rknpu_buffer_context();
+    ctx->dma_buf = dma_buf;
+    ctx->name = "rknpu_dma_buffer";
+
+    printf("RKNPU2: alloc_buffer SUCCESS size=%zu, virt_addr=%p, fd=%d\n", size, dma_buf.virt_addr, dma_buf.fd);
 
     static const ggml_backend_buffer_i rknpu_buffer_interface = {
         /* .free_buffer   = */ ggml_backend_rknpu_buffer_free_buffer,
