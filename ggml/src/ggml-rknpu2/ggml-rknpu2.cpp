@@ -424,9 +424,9 @@ static void rknpu_compute_forward_set_rows(struct ggml_tensor * dst) {
                         int n_dump = std::min((int64_t)4, ggml_nelements(src1));
                         fprintf(stderr, "RKNPU2: set_rows src1[0..%d] = [", n_dump - 1);
                         for (int j = 0; j < n_dump; ++j) {
-                            printf(" %d%s", p[j], (j < n_dump - 1 ? "," : ""));
+                            fprintf(stderr, " %d%s", p[j], (j < n_dump - 1 ? "," : ""));
                         }
-                        printf(" ]\n");
+                        fprintf(stderr, " ]\n");
                     }
                     fflush(stderr);
                 }
@@ -500,18 +500,18 @@ static void rknpu_compute_forward_get_rows(struct ggml_tensor * dst) {
                 int n_dump = std::min((size_t)16, ggml_nbytes(src1));
                 fprintf(stderr, "RKNPU2: get_rows src1[0..%d] (raw hex) = [", n_dump - 1);
                 for (int j = 0; j < n_dump; ++j) {
-                    printf(" %02x%s", p[j], (j < n_dump - 1 ? "," : ""));
+                    fprintf(stderr, " %02x%s", p[j], (j < n_dump - 1 ? "," : ""));
                 }
-                printf(" ]\n");
+                fprintf(stderr, " ]\n");
                 
                 if (src1->type == GGML_TYPE_I32) {
                     const int32_t * pi = (const int32_t *)src1->data;
                     int ni_dump = std::min((int64_t)4, ggml_nelements(src1));
                     fprintf(stderr, "RKNPU2: get_rows src1[0..%d] (int32) = [", ni_dump - 1);
                     for (int j = 0; j < ni_dump; ++j) {
-                        printf(" %d%s", pi[j], (j < ni_dump - 1 ? "," : ""));
+                        fprintf(stderr, " %d%s", pi[j], (j < ni_dump - 1 ? "," : ""));
                     }
-                    printf(" ]\n");
+                    fprintf(stderr, " ]\n");
                 }
             }
             fflush(stderr);
