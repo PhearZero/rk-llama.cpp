@@ -33,8 +33,6 @@ DmaBuffer alloc(size_t size) {
     buffer.size = size;
 
     const char* path = "/dev/dma_heap/system";
-    printf("RKNPU_DMA_ALLOC: Attempting to allocate %zu bytes from %s...\n", size, path);
-    fflush(stdout);
     int dma_heap_fd = open(path, O_RDWR);
     if (dma_heap_fd < 0) {
         fprintf(stderr, "RKNPU_DMA_ALLOC: Failed to open %s: %s\n", path, strerror(errno));
@@ -46,16 +44,11 @@ DmaBuffer alloc(size_t size) {
     buf_data.len = size;
     buf_data.fd_flags = O_CLOEXEC | O_RDWR;
 
-    printf("RKNPU_DMA_ALLOC: Calling IOCTL DMA_HEAP_IOCTL_ALLOC for size %zu...\n", size);
-    fflush(stdout);
     if (ioctl(dma_heap_fd, DMA_HEAP_IOCTL_ALLOC, &buf_data) < 0) {
         fprintf(stderr, "RKNPU_DMA_ALLOC: ioctl DMA_HEAP_IOCTL_ALLOC failed for size %zu: %s\n", size, strerror(errno));
         close(dma_heap_fd);
         return buffer;
     }
-    printf("RKNPU_DMA_ALLOC: IOCTL SUCCESS, fd=%d, size=%zu\n", buf_data.fd, size);
-    fflush(stdout);
-
     close(dma_heap_fd);
 
     if ((int32_t)buf_data.fd < 0) {
@@ -65,11 +58,7 @@ DmaBuffer alloc(size_t size) {
     }
 
     buffer.fd = buf_data.fd;
-    printf("RKNPU_DMA_ALLOC: Calling mmap for fd=%d, size=%zu...\n", buffer.fd, size);
-    fflush(stdout);
     buffer.virt_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, buffer.fd, 0);
-    printf("RKNPU_DMA_ALLOC: mmap returned %p\n", buffer.virt_addr);
-    fflush(stdout);
 
     if (buffer.virt_addr == MAP_FAILED) {
         fprintf(stderr, "RKNPU_DMA_ALLOC: mmap failed: %s\n", strerror(errno));
@@ -78,8 +67,6 @@ DmaBuffer alloc(size_t size) {
         buffer.virt_addr = nullptr;
     } else {
         // Zero-initialize the buffer to prevent stale garbage data
-        printf("RKNPU_DMA_ALLOC: Zeroing buffer of size %zu...\n", size);
-        fflush(stdout);
         memset(buffer.virt_addr, 0, size);
     }
 
