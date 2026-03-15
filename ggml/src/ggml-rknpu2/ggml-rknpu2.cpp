@@ -730,7 +730,11 @@ extern "C" {
         static struct ggml_backend_reg_i iface = {
             [](ggml_backend_reg_t r) { UNUSED(r); return "RKNPU"; },
             [](ggml_backend_reg_t r) { UNUSED(r); return (size_t)1; },
-            [](ggml_backend_reg_t r, size_t i) { UNUSED(r); UNUSED(i); return &rknpu_device; },
+            [](ggml_backend_reg_t r, size_t i) {
+                GGML_ASSERT(i == 0);
+                rknpu_device.reg = r;
+                return &rknpu_device;
+            },
             NULL
         };
         static struct ggml_backend_reg reg = { GGML_BACKEND_API_VERSION, iface, NULL };
