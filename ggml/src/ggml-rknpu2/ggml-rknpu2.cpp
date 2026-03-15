@@ -345,15 +345,21 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     size_t tensor_offset = ggml_backend_rknpu_get_tensor_offset(tensor->buffer, tensor);
     size_t total_offset = tensor_offset + offset;
 
-    printf("RKNPU2: rknpu_sync_tensor node=%s, type=%d, fd=%d, offset=%zu, size=%zu\n",
-           tensor->name, (int)type, ctx->dma_buf.fd, total_offset, size);
+    uint8_t * ptr = (uint8_t*)tensor->data + offset;
+    if (size >= 4) {
+        printf("RKNPU2: BEFORE sync %s node=%s, fd=%d, offset=%zu, size=%zu, data=%02x %02x %02x %02x\n", 
+            (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ctx->dma_buf.fd, total_offset, size, ptr[0], ptr[1], ptr[2], ptr[3]);
+    } else {
+        printf("RKNPU2: BEFORE sync %s node=%s, fd=%d, offset=%zu, size=%zu\n", 
+            (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ctx->dma_buf.fd, total_offset, size);
+    }
     fflush(stdout);
 
-    // Use standard RKNN pattern: base virt_addr + actual offset
+    // Use virt_addr = base + offset and offset = 0 which is often safer for driver consistency
     rknn_tensor_mem sync_mem = {};
-    sync_mem.virt_addr = ctx->dma_buf.virt_addr;
+    sync_mem.virt_addr = (uint8_t*)ctx->dma_buf.virt_addr + total_offset;
     sync_mem.fd = ctx->dma_buf.fd;
-    sync_mem.offset = (int32_t)total_offset; 
+    sync_mem.offset = 0; 
     sync_mem.size = (uint32_t)size;
     
     auto mem_ctx = get_rknpu_memory_context().get_ctx();
@@ -367,11 +373,16 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
         if (ret != 0) {
-            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, fd=%d, addr=%p, offset=%d, size=%u\n",
-                ret, tensor->name, (int)type, sync_mem.fd, sync_mem.virt_addr, sync_mem.offset, sync_mem.size);
+            printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, fd=%d, addr=%p, size=%u\n",
+                ret, tensor->name, (int)type, sync_mem.fd, sync_mem.virt_addr, sync_mem.size);
             fflush(stdout);
         } else {
-            printf("RKNPU2: rknpu_sync_tensor SUCCESS node=%s\n", tensor->name);
+            if (size >= 4) {
+                printf("RKNPU2: AFTER sync %s node=%s, data=%02x %02x %02x %02x\n", 
+                    (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ptr[0], ptr[1], ptr[2], ptr[3]);
+            } else {
+                printf("RKNPU2: AFTER sync %s node=%s SUCCESS\n", (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name);
+            }
             fflush(stdout);
         }
     }
@@ -582,6 +593,13 @@ static void rknpu_compute_forward_cpy(struct ggml_tensor * dst) {
 
 static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph* cgraph) {
     printf("RKNPU2: graph_compute n_nodes=%d\n", cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+        if (!node) continue;
+        void * base = node->buffer ? ggml_backend_buffer_get_base(node->buffer) : NULL;
+        size_t offset = base ? (size_t)((uint8_t*)node->data - (uint8_t*)base) : 0;
+        printf("RKNPU2: node[%d]: name=%s, op=%s, offset=%zu, size=%zu\n", i, node->name, ggml_op_name(node->op), offset, ggml_nbytes(node));
+    }
     fflush(stdout);
     auto* backend_ctx = (ggml_backend_rknpu_context*)backend->context;
 
