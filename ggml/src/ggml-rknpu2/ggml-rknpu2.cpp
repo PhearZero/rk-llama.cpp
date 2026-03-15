@@ -345,16 +345,6 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     size_t tensor_offset = ggml_backend_rknpu_get_tensor_offset(tensor->buffer, tensor);
     size_t total_offset = tensor_offset + offset;
 
-    uint8_t * ptr = (uint8_t*)tensor->data + offset;
-    if (size >= 4) {
-        printf("RKNPU2: BEFORE sync %s node=%s, fd=%d, offset=%zu, size=%zu, data=%02x %02x %02x %02x\n", 
-            (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ctx->dma_buf.fd, total_offset, size, ptr[0], ptr[1], ptr[2], ptr[3]);
-    } else {
-        printf("RKNPU2: BEFORE sync %s node=%s, fd=%d, offset=%zu, size=%zu\n", 
-            (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ctx->dma_buf.fd, total_offset, size);
-    }
-    fflush(stdout);
-
     // Use virt_addr = base + offset and offset = 0 which is often safer for driver consistency
     rknn_tensor_mem sync_mem = {};
     sync_mem.virt_addr = (uint8_t*)ctx->dma_buf.virt_addr + total_offset;
@@ -375,14 +365,6 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
         if (ret != 0) {
             printf("RKNPU2: rknpu_sync_tensor FAILED ret=%d, node=%s, type=%d, fd=%d, addr=%p, size=%u\n",
                 ret, tensor->name, (int)type, sync_mem.fd, sync_mem.virt_addr, sync_mem.size);
-            fflush(stdout);
-        } else {
-            if (size >= 4) {
-                printf("RKNPU2: AFTER sync %s node=%s, data=%02x %02x %02x %02x\n", 
-                    (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name, ptr[0], ptr[1], ptr[2], ptr[3]);
-            } else {
-                printf("RKNPU2: AFTER sync %s node=%s SUCCESS\n", (type == RKNN_MEMORY_SYNC_TO_DEVICE ? "TO" : "FROM"), tensor->name);
-            }
             fflush(stdout);
         }
     }
@@ -1052,21 +1034,21 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         {            
             int run_ret = RKNN_SUCC;
 
-            RKNN_CHECK(rknn_mem_sync(matmul_ctxs[0]->ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
+            auto mem_ctx = get_rknpu_memory_context().get_ctx();
+            RKNN_CHECK(rknn_mem_sync(mem_ctx, mem_A_shared.get(), RKNN_MEMORY_SYNC_TO_DEVICE), "sync A TO_DEVICE");
 
             for (size_t i = 0; i < num_active_segments; i++) {
                 RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctxs[i]->ctx, mem_A_shared.get(), &segments_io_attrs[i].A), "set_io_mem A for core");
             }
 
-            #pragma omp parallel for num_threads(num_active_segments)
+            // Running segments sequentially for better stability on some driver versions
             for (size_t i = 0; i < num_active_segments; i++) {
                 int ret = rknn_matmul_run(matmul_ctxs[i]->ctx);
                 if (ret != RKNN_SUCC) {
-                    #pragma omp critical
-                    {
-                        run_ret = ret;
-                        printf("RKNPU2: Failed to run matmul for node %s segment %zu core %d error %d! M=%d K=%d N=%d\n", node->name, i, active_segments[i].core_id, ret, M_op, K_op, active_segments[i].size_n);
-                    }
+                    run_ret = ret;
+                    printf("RKNPU2: Failed to run matmul for node %s segment %zu core %d error %d! M=%d K=%d N=%d\n", 
+                           node->name, i, active_segments[i].core_id, ret, M_op, K_op, active_segments[i].size_n);
+                    fflush(stdout);
                 }
             }
             if (run_ret != RKNN_SUCC) return GGML_STATUS_FAILED;
