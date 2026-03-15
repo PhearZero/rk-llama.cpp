@@ -215,9 +215,9 @@ static void rknpu_sync_tensor(const struct ggml_tensor * tensor, rknn_mem_sync_m
     size_t total_offset = ggml_backend_rknpu_get_tensor_offset(tensor->buffer, tensor) + offset;
     
     rknn_tensor_mem sync_mem = {};
-    sync_mem.virt_addr = (uint8_t*)buf_ctx->dma_buf.virt_addr + total_offset;
+    sync_mem.virt_addr = buf_ctx->dma_buf.virt_addr;
     sync_mem.fd = buf_ctx->dma_buf.fd;
-    sync_mem.offset = 0;
+    sync_mem.offset = (uint64_t)total_offset;
     sync_mem.size = (uint32_t)size;
     
     rknn_context mem_ctx = get_rknpu_memory_context().ctx;
@@ -372,7 +372,7 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             }
 
             if (!mB[j]) {
-                rknn_tensor_mem* m = rknn_create_mem_from_fd(ctxs[j]->ctx, ((ggml_backend_rknpu_buffer_context*)src0->buffer->context)->dma_buf.fd, (uint8_t*)((ggml_backend_rknpu_buffer_context*)src0->buffer->context)->dma_buf.virt_addr + aoff, bsz, 0);
+                rknn_tensor_mem* m = rknn_create_mem_from_fd(ctxs[j]->ctx, ((ggml_backend_rknpu_buffer_context*)src0->buffer->context)->dma_buf.fd, ((ggml_backend_rknpu_buffer_context*)src0->buffer->context)->dma_buf.virt_addr, bsz, (int32_t)aoff);
                 if (!m) return GGML_STATUS_FAILED;
                 
                 rknn_context cp = ctxs[j]->ctx;
@@ -441,6 +441,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
         }
 
         for (size_t j = 0; j < nseg; j++) RKNN_CHECK(rknn_matmul_set_io_mem(ctxs[j]->ctx, mA.get(), &ctxs[j]->io_attr.A), "set_io_mem A shared");
+        
+        {
+            rknn_tensor_mem sync_mA = *mA;
+            RKNN_CHECK(rknn_mem_sync(ctxs[0]->ctx, &sync_mA, RKNN_MEMORY_SYNC_TO_DEVICE), "sync mA TO_DEVICE");
+        }
 
 #pragma omp parallel num_threads(nseg)
         {
@@ -448,6 +453,9 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
             mC[j] = get_or_create_npu_buffer(bctx, ctxs[j]->ctx, ctxs[j]->io_attr.C.size, std::make_tuple(Mop, segs[j].size_n, segs[j].core_id), bctx->c_buffer_cache);
             RKNN_CHECK(rknn_matmul_set_io_mem(ctxs[j]->ctx, mC[j].get(), &ctxs[j]->io_attr.C), "set_io_mem C");
             RKNN_CHECK(rknn_matmul_run(ctxs[j]->ctx), "run");
+            
+            rknn_tensor_mem sync_mC = *mC[j];
+            RKNN_CHECK(rknn_mem_sync(ctxs[j]->ctx, &sync_mC, RKNN_MEMORY_SYNC_FROM_DEVICE), "sync mC FROM_DEVICE");
         }
 
         float scB = 1.0f;
@@ -613,7 +621,10 @@ static void ggml_backend_rknpu_buffer_get_tensor(ggml_backend_buffer_t b, const 
 static void ggml_backend_rknpu_buffer_clear(ggml_backend_buffer_t b, uint8_t v) {
     auto* c = (ggml_backend_rknpu_buffer_context *)b->context;
     memset(c->dma_buf.virt_addr, v, c->dma_buf.size);
-    rknn_tensor_mem sm = { c->dma_buf.virt_addr, 0, (uint32_t)c->dma_buf.size, c->dma_buf.fd };
+    rknn_tensor_mem sm = {};
+    sm.virt_addr = c->dma_buf.virt_addr;
+    sm.fd = c->dma_buf.fd;
+    sm.size = (uint32_t)c->dma_buf.size;
     rknn_mem_sync(get_rknpu_memory_context().ctx, &sm, RKNN_MEMORY_SYNC_TO_DEVICE);
 }
 
